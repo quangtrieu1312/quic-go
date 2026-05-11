@@ -672,6 +672,7 @@ func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.
 			encLevel = protocol.EncryptionHandshake
 		}
 	}
+	/*
 	if h.handshakeConfirmed && h.appDataPackets.history.HasOutstandingPackets() &&
 		!h.appDataPackets.lastAckElicitingPacketTime.IsZero() {
 		t := h.appDataPackets.lastAckElicitingPacketTime.Add(h.getScaledPTO(true))
@@ -680,6 +681,7 @@ func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.
 			encLevel = protocol.Encryption1RTT
 		}
 	}
+	*/
 	return pto, encLevel
 }
 
@@ -852,9 +854,11 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
 				h.removeFromBytesInFlight(p)
-				h.queueFramesForRetransmission(p)
-				if !p.IsPathMTUProbePacket {
-					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+				if encLevel != protocol.Encryption1RTT {
+					h.queueFramesForRetransmission(p)
+					if !p.IsPathMTUProbePacket {
+						h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+					}
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
@@ -1005,7 +1009,7 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		return h.ptoMode
 	}
 	// Only send ACKs if we're congestion limited.
-	if !h.congestion.CanSend(h.bytesInFlight) {
+	if !h.handshakeConfirmed && !h.congestion.CanSend(h.bytesInFlight) {
 		if h.logger.Debug() {
 			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, h.congestion.GetCongestionWindow())
 		}
@@ -1017,7 +1021,7 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		}
 		return SendAck
 	}
-	if !h.congestion.HasPacingBudget(now) {
+	if !h.handshakeConfirmed && !h.congestion.HasPacingBudget(now) {
 		return SendPacingLimited
 	}
 	return SendAny
@@ -1118,6 +1122,9 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 }
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
+	if h.handshakeConfirmed {
+		return
+	}
 	h.rttStats.ResetForPathMigration()
 	for pn, p := range h.appDataPackets.history.Packets() {
 		h.appDataPackets.history.DeclareLost(pn)
