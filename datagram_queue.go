@@ -1,9 +1,12 @@
 package quic
-
+// #cgo CXXFLAGS: -std=c++17 -I${SRCDIR}/lib/lockfree_mpmc_queue
+// #cgo LDFLAGS: -L${SRCDIR}/lib/lockfree_mpmc_queue -lqueue -lstdc++
+// #include "lib/lockfree_mpmc_queue/queue_wrapper.h"
+import "C"
 import (
 	"context"
-	
-	lfring "github.com/LENSHOOD/go-lock-free-ring-buffer"
+	"unsafe"
+	"sync"
 	
 	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/internal/wire"
@@ -14,11 +17,18 @@ const (
 	maxDatagramRcvQueueLen  = 128
 )
 
+var dataPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 1500)
+		return &b
+	},
+}
+
 type datagramQueue struct {
-	sendQueue lfring.RingBuffer[*wire.DatagramFrame]
+	sendQueue unsafe.Pointer
 	sent      chan struct{} // used to notify Add that a datagram was dequeued
 
-	rcvQueue lfring.RingBuffer[[]byte]
+	rcvQueue unsafe.Pointer
 	rcvd     chan struct{} // used to notify Receive that a new datagram was received
 
 	closeErr error
@@ -31,6 +41,8 @@ type datagramQueue struct {
 
 func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 	return &datagramQueue{
+		sendQueue: unsafe.Pointer(C.queue_new(C.int(maxDatagramSendQueueLen))),
+		rcvQueue:  unsafe.Pointer(C.queue_new(C.int(maxDatagramRcvQueueLen))),
 		hasData: hasData,
 		rcvd:    make(chan struct{}, 1),
 		sent:    make(chan struct{}, 1),
@@ -43,44 +55,33 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 // Up to 32 DATAGRAM frames will be queued.
 // Once that limit is reached, Add blocks until the queue size has reduced.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
-	h.sendMx.Lock()
-
 	for {
-		if h.sendQueue.Len() < maxDatagramSendQueueLen {
-			h.sendQueue.PushBack(f)
-			h.sendMx.Unlock()
+		if C.queue_push(h.sendQueue, unsafe.Pointer(f)) == 1 {
 			h.hasData()
 			return nil
 		}
-		select {
-		case <-h.sent: // drain the queue so we don't loop immediately
-		default:
-		}
-		h.sendMx.Unlock()
+		// queue full, wait for Pop to signal
 		select {
 		case <-h.closed:
 			return h.closeErr
 		case <-h.sent:
 		}
-		h.sendMx.Lock()
 	}
 }
 
 // Peek gets the next DATAGRAM frame for sending.
 // If actually sent out, Pop needs to be called before the next call to Peek.
 func (h *datagramQueue) Peek() *wire.DatagramFrame {
-	h.sendMx.Lock()
-	defer h.sendMx.Unlock()
-	if h.sendQueue.Empty() {
+	var out unsafe.Pointer
+	if C.queue_peek(h.sendQueue, &out) == 0 {
 		return nil
 	}
-	return h.sendQueue.PeekFront()
+	return (*wire.DatagramFrame)(out)
 }
 
 func (h *datagramQueue) Pop() {
-	h.sendMx.Lock()
-	defer h.sendMx.Unlock()
-	_ = h.sendQueue.PopFront()
+	var out unsafe.Pointer
+	C.queue_pop(h.sendQueue, &out)
 	select {
 	case h.sent <- struct{}{}:
 	default:
@@ -89,35 +90,30 @@ func (h *datagramQueue) Pop() {
 
 // HandleDatagramFrame handles a received DATAGRAM frame.
 func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
-	data := make([]byte, len(f.Data))
-	copy(data, f.Data)
-	var queued bool
-	h.rcvMx.Lock()
-	if len(h.rcvQueue) < maxDatagramRcvQueueLen {
-		h.rcvQueue = append(h.rcvQueue, data)
-		queued = true
+	bufp := dataPool.Get().(*[]byte)
+    if cap(*bufp) < len(f.Data) {
+        *bufp = make([]byte, len(f.Data))
+    }
+    *bufp = (*bufp)[:len(f.Data)]
+    copy(*bufp, f.Data)
+	if C.queue_push(h.rcvQueue, unsafe.Pointer(bufp)) == 1 {
 		select {
 		case h.rcvd <- struct{}{}:
 		default:
 		}
-	}
-	h.rcvMx.Unlock()
-	if !queued && h.logger.Debug() {
+	} else if h.logger.Debug() {
 		h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
+		dataPool.Put(bufp)
 	}
 }
 
 // Receive gets a received DATAGRAM frame.
 func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 	for {
-		h.rcvMx.Lock()
-		if len(h.rcvQueue) > 0 {
-			data := h.rcvQueue[0]
-			h.rcvQueue = h.rcvQueue[1:]
-			h.rcvMx.Unlock()
-			return data, nil
+		var out unsafe.Pointer
+		if C.queue_pop(h.rcvQueue, &out) == 1 {
+			return *(*[]byte)(out), nil
 		}
-		h.rcvMx.Unlock()
 		select {
 		case <-h.rcvd:
 			continue
@@ -131,5 +127,7 @@ func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 
 func (h *datagramQueue) CloseWithError(e error) {
 	h.closeErr = e
+	C.queue_free(h.sendQueue)
+	C.queue_free(h.rcvQueue)
 	close(h.closed)
 }
