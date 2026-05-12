@@ -1,0 +1,3 @@
+[submodule "vendor/lockfree_mpmc_queue"]
+	path = vendor/lockfree_mpmc_queue
+	url = git@github.com:quangtrieu1312/lockfree_mpmc_queue

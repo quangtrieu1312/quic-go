@@ -2,10 +2,10 @@ package quic
 
 import (
 	"context"
-	"sync"
-
+	
+	lfring "github.com/LENSHOOD/go-lock-free-ring-buffer"
+	
 	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/internal/utils/ringbuffer"
 	"github.com/quic-go/quic-go/internal/wire"
 )
 
@@ -15,12 +15,10 @@ const (
 )
 
 type datagramQueue struct {
-	sendMx    sync.Mutex
-	sendQueue ringbuffer.RingBuffer[*wire.DatagramFrame]
+	sendQueue lfring.RingBuffer[*wire.DatagramFrame]
 	sent      chan struct{} // used to notify Add that a datagram was dequeued
 
-	rcvMx    sync.Mutex
-	rcvQueue [][]byte
+	rcvQueue lfring.RingBuffer[[]byte]
 	rcvd     chan struct{} // used to notify Receive that a new datagram was received
 
 	closeErr error
