@@ -35,6 +35,7 @@ var _ ipv4.Message = ipv6.Message{}
 
 type batchConn interface {
 	ReadBatch(ms []ipv4.Message, flags int) (int, error)
+	WriteBatch(ms []ipv4.Message, flags int) (int, error)
 }
 
 func inspectReadBuffer(c syscall.RawConn) (int, error) {
@@ -338,22 +339,18 @@ func appendIPv6ECNMsg(b []byte, val protocol.ECN) []byte {
 }
 
 func (c *oobConn) WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error {
-    msgs := make([]ipv4.Message, len(entries))
+	msgs := make([]ipv4.Message, len(entries))
     for i, e := range entries {
         oob := baseOOB
         if e.gsoSize > 0 {
             oob = appendUDPSegmentSizeMsg(oob, e.gsoSize)
         }
-        // append ECN if needed...
         msgs[i] = ipv4.Message{
             Buffers: [][]byte{e.buf.Data},
             OOB:     oob,
             Addr:    addr,
         }
     }
-    // ipv4.PacketConn.WriteBatch calls sendmmsg internally
-    _, err := c.batchConn.(interface {
-        WriteBatch(ms []ipv4.Message, flags int) (int, error)
-    }).WriteBatch(msgs, 0)
+    _, err := c.batchConn.WriteBatch(msgs, 0)  // no type assertion needed
     return err
 }
