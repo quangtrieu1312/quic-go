@@ -32,6 +32,7 @@ type rawConn interface {
 	// gsoSize is the size of a single packet, or 0 to disable GSO.
 	// It is invalid to set gsoSize if capabilities.GSO is not set.
 	WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN) (int, error)
+	WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error
 	LocalAddr() net.Addr
 	SetReadDeadline(time.Time) error
 	io.Closer

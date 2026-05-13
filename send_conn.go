@@ -129,15 +129,5 @@ func (c *sconn) RemoteAddr() net.Addr { return c.remoteAddrInfo.Load().addr }
 func (c *sconn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *sconn) WriteBatch(entries []queueEntry) error {
 	ai := c.remoteAddrInfo.Load()
-    if oob, ok := c.rawConn.(*oobConn); ok {
-        return oob.WriteBatch(entries, ai.addr, ai.oob)
-    }
-    fmt.Printf("WriteBatch: type assertion failed, rawConn type is %T", c.rawConn) 
-    // fallback for non-oobConn (tests, etc.)
-    for _, e := range entries {
-        if err := c.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
-            return err
-        }
-    }
-    return nil
+    return c.rawConn.WriteBatch(entries, ai.addr, ai.oob)
 }
