@@ -2,6 +2,7 @@ package quic
 
 import (
 	"net"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/quic-go/quic-go/internal/protocol"
@@ -131,6 +132,7 @@ func (c *sconn) WriteBatch(entries []queueEntry) error {
     if oob, ok := c.rawConn.(*oobConn); ok {
         return oob.WriteBatch(entries, ai.addr, ai.oob)
     }
+    fmt.Printf("WriteBatch: type assertion failed, rawConn type is %T", c.rawConn) 
     // fallback for non-oobConn (tests, etc.)
     for _, e := range entries {
         if err := c.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
