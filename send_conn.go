@@ -2,7 +2,6 @@ package quic
 
 import (
 	"net"
-	"fmt"
 	"sync/atomic"
 
 	"github.com/quic-go/quic-go/internal/protocol"

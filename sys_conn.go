@@ -142,3 +142,12 @@ func (c *basicConn) WritePacket(b []byte, addr net.Addr, _ []byte, gsoSize uint1
 }
 
 func (c *basicConn) capabilities() connCapabilities { return connCapabilities{DF: c.supportsDF} }
+
+func (c *basicConn) WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error {
+    for _, e := range entries {
+        if _, err := c.WritePacket(e.buf.Data, addr, baseOOB, e.gsoSize, e.ecn); err != nil {
+            return err
+        }
+    }
+    return nil
+}
