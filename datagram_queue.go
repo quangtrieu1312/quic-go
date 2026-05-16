@@ -1,6 +1,6 @@
 package quic
-// #cgo CXXFLAGS: -std=c++17 -I${SRCDIR}/../../lib/lockfree_mpmc_queue
-// #cgo LDFLAGS: -L${SRCDIR}/../../lib/lockfree_mpmc_queue -L/usr/lib -lstdc++ -latomic
+// #cgo CXXFLAGS: -std=c++17 -I${SRCDIR}/../lib/lockfree_mpmc_queue
+// #cgo LDFLAGS: -L${SRCDIR}/../lib/lockfree_mpmc_queue -L/usr/lib -lstdc++ -latomic
 // #include "queue_wrapper.h"
 import "C"
 import (
