@@ -1,5 +1,5 @@
 #include "queue_wrapper.h"
-#include "lib/lockfree_mpmc_queue/mpmc_queue.h"
+#include "mpmc_queue.h"
 
 using Queue = es::lockfree::mpmc_queue<void*>;
 
