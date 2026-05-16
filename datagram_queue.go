@@ -182,5 +182,4 @@ func (h *datagramQueue) CloseWithError(e error) {
 
     C.queue_free(h.sendQueue)
     C.queue_free(h.rcvQueue)
-    close(h.closed)
 }
