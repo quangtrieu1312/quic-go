@@ -63,9 +63,18 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
     p.Pin(&f.Data)  // pin the slice header's backing array reference
 	for {
 		if C.queue_push(h.sendQueue, unsafe.Pointer(f)) == 1 {
-			h.pinners.Store(uintptr(unsafe.Pointer(f)), p)
-			h.hasData()
-			return nil
+		    h.pinners.Store(uintptr(unsafe.Pointer(f)), p)
+    		// CloseWithError may have drained before Store — self-cleanup
+    		select {
+    			case <-h.closed:
+        			if v, ok := h.pinners.LoadAndDelete(uintptr(unsafe.Pointer(f))); ok {
+            			v.(*runtime.Pinner).Unpin()
+        			}
+        			return h.closeErr
+    			default:
+        			h.hasData()
+        			return nil
+    		}
 		}
 		// queue full, wait for Pop to signal
 		select {
@@ -151,7 +160,7 @@ func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 
 func (h *datagramQueue) CloseWithError(e error) {
 	h.closeErr = e
-
+    close(h.closed) // signal first, THEN drain
     // drain send queue and unpin
     var out unsafe.Pointer
     for C.queue_pop(h.sendQueue, &out) == 1 {
