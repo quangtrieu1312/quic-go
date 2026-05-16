@@ -101,6 +101,11 @@ func (h *datagramQueue) Pop() {
 
 // HandleDatagramFrame handles a received DATAGRAM frame.
 func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
+	select {
+    	case <-h.closed:
+        	return  // connection already closed, drop it
+    	default:
+    }
 	bufp := dataPool.Get().(*[]byte)
     if cap(*bufp) < len(f.Data) {
         *bufp = make([]byte, len(f.Data))
