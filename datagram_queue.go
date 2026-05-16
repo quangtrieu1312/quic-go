@@ -124,17 +124,27 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 	p := new(runtime.Pinner)
     p.Pin(bufp)
 	if C.queue_push(h.rcvQueue, unsafe.Pointer(bufp)) == 1 {
-		h.pinners.Store(uintptr(unsafe.Pointer(bufp)), p)
-		select {
-		case h.rcvd <- struct{}{}:
-		default:
-		}
+    	h.pinners.Store(uintptr(unsafe.Pointer(bufp)), p)
+    	// CloseWithError may have drained before Store — self-cleanup
+    	select {
+    		case <-h.closed:
+        		if v, ok := h.pinners.LoadAndDelete(uintptr(unsafe.Pointer(bufp))); ok {
+            		v.(*runtime.Pinner).Unpin()
+        		}
+        		dataPool.Put(bufp)
+        		return
+    		default:
+        		select {
+        			case h.rcvd <- struct{}{}:
+        			default:
+        		}
+    	}
 	} else {
-		p.Unpin()
-		dataPool.Put(bufp)
-		if h.logger.Debug() {
-			h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
-		}
+    	p.Unpin()
+    	dataPool.Put(bufp)
+    	if h.logger.Debug() {
+        	h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
+    	}
 	}
 }
 
