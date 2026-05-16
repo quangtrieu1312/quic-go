@@ -146,7 +146,25 @@ func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 
 func (h *datagramQueue) CloseWithError(e error) {
 	h.closeErr = e
-	C.queue_free(h.sendQueue)
-	C.queue_free(h.rcvQueue)
-	close(h.closed)
+
+    // drain send queue and unpin
+    var out unsafe.Pointer
+    for C.queue_pop(h.sendQueue, &out) == 1 {
+        if v, ok := h.pinners.LoadAndDelete(uintptr(out)); ok {
+            v.(*runtime.Pinner).Unpin()
+        }
+    }
+
+    // drain receive queue and unpin
+    for C.queue_pop(h.rcvQueue, &out) == 1 {
+        if v, ok := h.pinners.LoadAndDelete(uintptr(out)); ok {
+            v.(*runtime.Pinner).Unpin()
+        }
+        // also return the buffer to the pool
+        dataPool.Put((*[]byte)(out))
+    }
+
+    C.queue_free(h.sendQueue)
+    C.queue_free(h.rcvQueue)
+    close(h.closed)
 }
