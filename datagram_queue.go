@@ -129,10 +129,12 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 		case h.rcvd <- struct{}{}:
 		default:
 		}
-	} else if h.logger.Debug() {
+	} else {
 		p.Unpin()
-		h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
 		dataPool.Put(bufp)
+		if h.logger.Debug() {
+			h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
+		}
 	}
 }
 
