@@ -43,7 +43,7 @@ type datagramQueue struct {
 }
 
 func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
-	return &datagramQueue{
+	q := &datagramQueue{
 		sendQueue: unsafe.Pointer(C.queue_new(C.int(maxDatagramSendQueueLen))),
 		rcvQueue:  unsafe.Pointer(C.queue_new(C.int(maxDatagramRcvQueueLen))),
 		hasData: hasData,
@@ -52,6 +52,11 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 		closed:  make(chan struct{}),
 		logger:  logger,
 	}
+	runtime.SetFinalizer(q, func(q *datagramQueue) {
+        C.queue_free(q.sendQueue)
+        C.queue_free(q.rcvQueue)
+    })
+    return q
 }
 
 // Add queues a new DATAGRAM frame for sending.
@@ -189,7 +194,4 @@ func (h *datagramQueue) CloseWithError(e error) {
         // also return the buffer to the pool
         dataPool.Put((*[]byte)(out))
     }
-
-    C.queue_free(h.sendQueue)
-    C.queue_free(h.rcvQueue)
 }
