@@ -130,6 +130,9 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
     copy(*bufp, f.Data)
 	p := new(runtime.Pinner)
     p.Pin(bufp)
+	if len(*bufp) > 0 {
+    	p.Pin(unsafe.SliceData(*bufp))
+	}
 	if C.queue_push(h.rcvQueue, unsafe.Pointer(bufp)) == 1 {
     	h.pinners.Store(uintptr(unsafe.Pointer(bufp)), p)
     	// CloseWithError may have drained before Store — self-cleanup
