@@ -65,7 +65,9 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	p := new(runtime.Pinner)
     p.Pin(f)
-    p.Pin(&f.Data)  // pin the slice header's backing array reference
+	if len(f.Data) > 0 {
+    	p.Pin(unsafe.SliceData(f.Data))  // ← pins the actual backing array
+	}
 	for {
 		if C.queue_push(h.sendQueue, unsafe.Pointer(f)) == 1 {
 		    h.pinners.Store(uintptr(unsafe.Pointer(f)), p)
