@@ -185,6 +185,9 @@ func (h *datagramQueue) CloseWithError(e error) {
     close(h.closed) // signal first, THEN drain
     // drain send queue and unpin
     var out unsafe.Pointer
+	var pinner runtime.Pinner
+    pinner.Pin(&out)
+    defer pinner.Unpin()
     for C.queue_pop(h.sendQueue, &out) == 1 {
         if v, ok := h.pinners.LoadAndDelete(uintptr(out)); ok {
             v.(*runtime.Pinner).Unpin()

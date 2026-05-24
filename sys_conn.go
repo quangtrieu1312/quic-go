@@ -145,11 +145,15 @@ func (c *basicConn) capabilities() connCapabilities { return connCapabilities{DF
 
 func (c *basicConn) WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error {
 	// If underlying conn implements native batch write, use it
-    type nativeBatcher interface {
-        WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error
+	type nativeBatcher interface {
+    	WriteBatch(pkts [][]byte, addr net.Addr) error
     }
     if nb, ok := c.PacketConn.(nativeBatcher); ok {
-        return nb.WriteBatch(entries, addr, baseOOB)
+        pkts := make([][]byte, len(entries))
+        for i, e := range entries {
+            pkts[i] = e.buf.Data
+        }
+        return nb.WriteBatch(pkts, addr)
     }
     for _, e := range entries {
         if _, err := c.WritePacket(e.buf.Data, addr, baseOOB, e.gsoSize, e.ecn); err != nil {
