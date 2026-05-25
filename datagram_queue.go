@@ -50,33 +50,26 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 	}
 }
 
-// Add queues a new DATAGRAM frame for sending.
-// Once the send queue is full, Add blocks until the queue size has reduced. This
-// applies backpressure to the caller (the tunnel's TUN/forward reader) rather
-// than silently dropping — for a VPN dataplane, slowing the inner TCP via a full
-// kernel queue is better than dropping a segment it then has to retransmit.
+// Add queues a new DATAGRAM frame for sending. The queue is bounded; when full
+// it DROPS (returns nil) rather than blocking.
+//
+// This is deliberately NOT upstream's blocking Add. Datagrams are unreliable and
+// every other stage of this dataplane drops on overflow. Worse, blocking here
+// deadlocks the caller's goroutine until the connection's idle timeout: with
+// congestion control disabled the sender keeps emitting to a vanished peer until
+// MaxOutstandingSentPackets is hit, at which point SendMode stops draining the
+// queue — so a blocking Add would wedge the per-connection drain goroutine for
+// the full MaxIdleTimeout (~30s) after a disconnect, stalling the next reconnect.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	h.sendMx.Lock()
-
-	for {
-		if h.sendQueue.Len() < maxDatagramSendQueueLen {
-			h.sendQueue.PushBack(f)
-			h.sendMx.Unlock()
-			h.hasData()
-			return nil
-		}
-		select {
-		case <-h.sent: // drain the queue so we don't loop immediately
-		default:
-		}
+	if h.sendQueue.Len() >= maxDatagramSendQueueLen {
 		h.sendMx.Unlock()
-		select {
-		case <-h.closed:
-			return h.closeErr
-		case <-h.sent:
-		}
-		h.sendMx.Lock()
+		return nil // queue full → drop (unreliable datagram)
 	}
+	h.sendQueue.PushBack(f)
+	h.sendMx.Unlock()
+	h.hasData()
+	return nil
 }
 
 // Peek gets the next DATAGRAM frame for sending.
