@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	maxDatagramSendQueueLen = 32
-	maxDatagramRcvQueueLen  = 128
+	maxDatagramSendQueueLen = 1024
+	maxDatagramRcvQueueLen  = 1024
 )
 
 var dataPool = sync.Pool{
@@ -68,29 +68,22 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	if len(f.Data) > 0 {
     	p.Pin(unsafe.SliceData(f.Data))  // ← pins the actual backing array
 	}
-	for {
-		if C.queue_push(h.sendQueue, unsafe.Pointer(f)) == 1 {
-		    h.pinners.Store(uintptr(unsafe.Pointer(f)), p)
-    		// CloseWithError may have drained before Store — self-cleanup
-    		select {
-    			case <-h.closed:
-        			if v, ok := h.pinners.LoadAndDelete(uintptr(unsafe.Pointer(f))); ok {
-            			v.(*runtime.Pinner).Unpin()
-        			}
-        			return h.closeErr
-    			default:
-        			h.hasData()
-        			return nil
-    		}
-		}
-		// queue full, wait for Pop to signal
-		select {
-		case <-h.closed:
-			p.Unpin()
-			return h.closeErr
-		case <-h.sent:
-		}
+	if C.queue_push(h.sendQueue, unsafe.Pointer(f)) == 1 {
+		h.pinners.Store(uintptr(unsafe.Pointer(f)), p)
+    	// CloseWithError may have drained before Store — self-cleanup
+    	select {
+    		case <-h.closed:
+        		if v, ok := h.pinners.LoadAndDelete(uintptr(unsafe.Pointer(f))); ok {
+            		v.(*runtime.Pinner).Unpin()
+        		}
+        		return h.closeErr
+    		default:
+        		h.hasData()
+        		return nil
+    	}
 	}
+	p.Unpin()
+	return nil
 }
 
 // Peek gets the next DATAGRAM frame for sending.
