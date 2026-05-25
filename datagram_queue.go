@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	maxDatagramSendQueueLen = 1024
-	maxDatagramRcvQueueLen  = 1024
+	maxDatagramSendQueueLen = 2048
+	maxDatagramRcvQueueLen  = 2048
 )
 
 var dataPool = sync.Pool{
