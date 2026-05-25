@@ -32,7 +32,17 @@ var (
 const (
 	maxDatagramSendQueueLen = 1024
 	maxDatagramRcvQueueLen  = 1024
+	// Pooled receive-buffer size. Inner MTU is ~1252; a QUIC DATAGRAM payload
+	// (contextID varint + inner packet) stays well under this. Larger frames
+	// fall back to a fresh allocation.
+	maxDatagramRcvBufSize = 1500
 )
+
+// datagramRcvBufPool recycles the per-datagram receive buffers allocated in
+// HandleDatagramFrame, eliminating one alloc+GC cycle per received datagram on
+// the hot path (bulk data AND the ACK flood). See Receive for the recycling
+// invariant.
+var datagramRcvBufPool = sync.Pool{New: func() any { return make([]byte, maxDatagramRcvBufSize) }}
 
 type datagramQueue struct {
 	sendMx    sync.Mutex
@@ -41,6 +51,7 @@ type datagramQueue struct {
 
 	rcvMx    sync.Mutex
 	rcvQueue [][]byte
+	lastRcv  []byte        // buffer handed out by the previous Receive, recycled on the next
 	rcvd     chan struct{} // used to notify Receive that a new datagram was received
 
 	closeErr error
@@ -107,7 +118,12 @@ func (h *datagramQueue) Pop() {
 
 // HandleDatagramFrame handles a received DATAGRAM frame.
 func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
-	data := make([]byte, len(f.Data))
+	var data []byte
+	if len(f.Data) <= maxDatagramRcvBufSize {
+		data = datagramRcvBufPool.Get().([]byte)[:len(f.Data)]
+	} else {
+		data = make([]byte, len(f.Data))
+	}
 	copy(data, f.Data)
 	var queued bool
 	h.rcvMx.Lock()
@@ -121,6 +137,9 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 	}
 	h.rcvMx.Unlock()
 	if !queued {
+		if cap(data) == maxDatagramRcvBufSize {
+			datagramRcvBufPool.Put(data[:cap(data)])
+		}
 		datagramRcvDrops.Add(1)
 		if h.logger.Debug() {
 			h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
@@ -135,6 +154,18 @@ func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 		if len(h.rcvQueue) > 0 {
 			data := h.rcvQueue[0]
 			h.rcvQueue = h.rcvQueue[1:]
+			// Recycle the buffer returned by the PREVIOUS Receive call. Safe
+			// because there is a single sequential consumer per connection
+			// (connect-ip Conn.ReadPacket) that fully copies the slice out
+			// before calling Receive again. Do NOT call Receive concurrently
+			// for one connection, or this becomes a use-after-free.
+			if h.lastRcv != nil {
+				datagramRcvBufPool.Put(h.lastRcv[:cap(h.lastRcv)])
+				h.lastRcv = nil
+			}
+			if cap(data) == maxDatagramRcvBufSize {
+				h.lastRcv = data
+			}
 			h.rcvMx.Unlock()
 			return data, nil
 		}
