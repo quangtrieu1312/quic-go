@@ -1021,7 +1021,12 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		}
 		return SendAck
 	}
-	if !h.handshakeConfirmed && !h.congestion.HasPacingBudget(now) {
+	// Pacing stays enabled even after the handshake (unlike the CanSend check
+	// above, which is gated behind !handshakeConfirmed to keep congestion control
+	// off the dataplane). Pacing smooths sends to avoid self-inflicted
+	// buffer-overflow loss; its rate is floored independently of cwnd — see
+	// pacingFloorBytesPerSec in internal/congestion/pacer.go.
+	if !h.congestion.HasPacingBudget(now) {
 		return SendPacingLimited
 	}
 	return SendAny

@@ -10,6 +10,18 @@ import (
 
 const maxBurstSizePackets = 10
 
+// pacingFloorBytesPerSec is a lower bound on the pacer's rate, decoupled from the
+// congestion window. The dataplane runs with congestion control disabled (see
+// SendMode), but cwnd still shrinks on loss — and since the pacing rate is
+// derived from cwnd, re-enabling pacing without this floor would let loss drag
+// the send rate toward zero. The floor keeps the tunnel pacing at ~link rate:
+// bursts are still smoothed (token bucket), but loss can't throttle throughput.
+//
+// Tune this to just under the path's bottleneck rate. Too high → bursts still
+// overflow buffers; too low → caps throughput. 0 disables the floor (stock
+// cwnd-derived pacing). Sweep it to find the knee.
+const pacingFloorBytesPerSec = 800 * 1000 * 1000 / 8 // ~800 Mbit/s
+
 // The pacer implements a token bucket pacing algorithm.
 type pacer struct {
 	budgetAtLastSent  protocol.ByteCount
@@ -28,7 +40,13 @@ func newPacer(getBandwidth func() Bandwidth) *pacer {
 			// RTT variations then won't result in under-utilization of the congestion window.
 			// Ultimately, this will result in sending packets as acknowledgments are received rather than when timers fire,
 			// provided the congestion window is fully utilized and acknowledgments arrive at regular intervals.
-			return bw * 5 / 4
+			bw = bw * 5 / 4
+			// Floor the rate so loss-driven cwnd reduction can't throttle the
+			// (congestion-control-disabled) dataplane. See pacingFloorBytesPerSec.
+			if pacingFloorBytesPerSec > 0 && bw < pacingFloorBytesPerSec {
+				return pacingFloorBytesPerSec
+			}
+			return bw
 		},
 	}
 	p.budgetAtLastSent = p.maxBurstSize()
