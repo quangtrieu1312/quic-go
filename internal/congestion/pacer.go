@@ -20,7 +20,7 @@ const maxBurstSizePackets = 10
 // Tune this to just under the path's bottleneck rate. Too high → bursts still
 // overflow buffers; too low → caps throughput. 0 disables the floor (stock
 // cwnd-derived pacing). Sweep it to find the knee.
-const pacingFloorBytesPerSec = 800 * 1000 * 1000 / 8 // ~800 Mbit/s
+const pacingFloorBytesPerSec = 150 * 1000 * 1000 / 8 // ~150 Mbit/s per connection
 
 // The pacer implements a token bucket pacing algorithm.
 type pacer struct {
