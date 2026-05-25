@@ -2,11 +2,22 @@ package quic
 
 import (
 	"context"
+	"expvar"
 	"sync"
 
 	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/internal/utils/ringbuffer"
 	"github.com/quic-go/quic-go/internal/wire"
+)
+
+// Datagram-queue drop counters. These are the blind spot the app-level drop
+// counters don't cover — a full send/recv queue here silently drops an
+// (unrecoverable) datagram. Exposed via expvar, so they show up at
+// /debug/vars on any binary that serves net/http/pprof (server :6060,
+// client :9484). Watch the delta across a test to localize tunnel loss.
+var (
+	datagramSendDrops = expvar.NewInt("quic_datagram_send_drops")
+	datagramRcvDrops  = expvar.NewInt("quic_datagram_rcv_drops")
 )
 
 // Phase 1 (perf): this is the upstream quic-go datagram queue — a per-connection
@@ -64,6 +75,7 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	h.sendMx.Lock()
 	if h.sendQueue.Len() >= maxDatagramSendQueueLen {
 		h.sendMx.Unlock()
+		datagramSendDrops.Add(1)
 		return nil // queue full → drop (unreliable datagram)
 	}
 	h.sendQueue.PushBack(f)
@@ -108,8 +120,11 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 		}
 	}
 	h.rcvMx.Unlock()
-	if !queued && h.logger.Debug() {
-		h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
+	if !queued {
+		datagramRcvDrops.Add(1)
+		if h.logger.Debug() {
+			h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
+		}
 	}
 }
 
