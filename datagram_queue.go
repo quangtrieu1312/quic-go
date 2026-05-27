@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	"encoding/binary"
 	"expvar"
 	"sync"
 
@@ -19,6 +20,85 @@ var (
 	datagramSendDrops = expvar.NewInt("quic_datagram_send_drops")
 	datagramRcvDrops  = expvar.NewInt("quic_datagram_rcv_drops")
 )
+
+// Datagram inner-TCP-seq order counters. These localize where the download inner
+// reorder enters the quic-go datagram transport. Each counts a datagram as
+// out-of-order when its inner TCP seq is below the per-flow high-water mark seen
+// so far at that point (a retransmit also registers, but the retransmit baseline
+// is constant across points, so the DELTA between points = genuine reorder added):
+//   dg_send_*   : at Pop (sender commits datagram to a packet) — server=download send
+//   dg_rcvin_*  : at HandleDatagramFrame (receiver enqueues)    — client=download recv-in
+//   dg_rcvout_* : at Receive (receiver delivers to app)         — client=download recv-out
+// Payload is connect-ip [contextID varint][IP packet]; non-TCP/short frames skipped.
+var (
+	dgSendTotal   = expvar.NewInt("dg_send_total")
+	dgSendOOO     = expvar.NewInt("dg_send_ooo")
+	dgRcvInTotal  = expvar.NewInt("dg_rcvin_total")
+	dgRcvInOOO    = expvar.NewInt("dg_rcvin_ooo")
+	dgRcvOutTotal = expvar.NewInt("dg_rcvout_total")
+	dgRcvOutOOO   = expvar.NewInt("dg_rcvout_ooo")
+)
+
+// dgInnerSeq parses a quic-level DATAGRAM payload into a 5-tuple flow key and the
+// inner TCP sequence number. At the quic layer the payload is HTTP/3-datagram framed:
+// [Quarter Stream ID varint][Context ID varint][IP packet] (RFC 9297 + connect-ip).
+// ok is false for non-IPv4, non-TCP, or truncated frames.
+func dgInnerSeq(p []byte) (key [13]byte, seq uint32, ok bool) {
+	off := 0
+	// skip the Quarter Stream ID then the Context ID varint
+	for i := 0; i < 2; i++ {
+		if off >= len(p) {
+			return
+		}
+		off += 1 << (p[off] >> 6)
+	}
+	if len(p) < off+20 {
+		return
+	}
+	ip := p[off:]
+	if ip[0]>>4 != 4 || ip[9] != 6 { // IPv4 + TCP
+		return
+	}
+	ihl := int(ip[0]&0x0f) * 4
+	if len(ip) < ihl+8 {
+		return
+	}
+	tcp := ip[ihl:]
+	seq = binary.BigEndian.Uint32(tcp[4:8])
+	copy(key[0:4], ip[12:16])
+	copy(key[4:8], ip[16:20])
+	copy(key[8:12], tcp[0:4]) // src+dst ports
+	key[12] = 6
+	ok = true
+	return
+}
+
+// dgObs tracks per-flow inner-seq high-water marks at one observation point. Each
+// instance is touched by a single goroutine (Pop/HandleDatagramFrame by the conn
+// run loop; Receive by the app reader), so it needs no lock.
+type dgObs struct{ maxSeq map[[13]byte]uint32 }
+
+func newDgObs() *dgObs { return &dgObs{maxSeq: make(map[[13]byte]uint32)} }
+
+func (o *dgObs) observe(p []byte, total, ooo *expvar.Int) {
+	key, seq, ok := dgInnerSeq(p)
+	if !ok {
+		return
+	}
+	total.Add(1)
+	mx, seen := o.maxSeq[key]
+	switch {
+	case !seen:
+		if len(o.maxSeq) >= 1<<16 {
+			o.maxSeq = make(map[[13]byte]uint32)
+		}
+		o.maxSeq[key] = seq
+	case int32(seq-mx) < 0:
+		ooo.Add(1)
+	default:
+		o.maxSeq[key] = seq
+	}
+}
 
 // Phase 1 (perf): this is the upstream quic-go datagram queue — a per-connection
 // sync.Mutex + ring buffer, pure Go, zero allocation on the send hot path.
@@ -59,16 +139,23 @@ type datagramQueue struct {
 
 	hasData func()
 
+	sendObs   *dgObs
+	rcvInObs  *dgObs
+	rcvOutObs *dgObs
+
 	logger utils.Logger
 }
 
 func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 	return &datagramQueue{
-		hasData: hasData,
-		rcvd:    make(chan struct{}, 1),
-		sent:    make(chan struct{}, 1),
-		closed:  make(chan struct{}),
-		logger:  logger,
+		hasData:   hasData,
+		rcvd:      make(chan struct{}, 1),
+		sent:      make(chan struct{}, 1),
+		closed:    make(chan struct{}),
+		sendObs:   newDgObs(),
+		rcvInObs:  newDgObs(),
+		rcvOutObs: newDgObs(),
+		logger:    logger,
 	}
 }
 
@@ -109,7 +196,10 @@ func (h *datagramQueue) Peek() *wire.DatagramFrame {
 func (h *datagramQueue) Pop() {
 	h.sendMx.Lock()
 	defer h.sendMx.Unlock()
-	_ = h.sendQueue.PopFront()
+	f := h.sendQueue.PopFront()
+	if f != nil {
+		h.sendObs.observe(f.Data, dgSendTotal, dgSendOOO)
+	}
 	select {
 	case h.sent <- struct{}{}:
 	default:
@@ -118,6 +208,7 @@ func (h *datagramQueue) Pop() {
 
 // HandleDatagramFrame handles a received DATAGRAM frame.
 func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
+	h.rcvInObs.observe(f.Data, dgRcvInTotal, dgRcvInOOO)
 	var data []byte
 	if len(f.Data) <= maxDatagramRcvBufSize {
 		data = datagramRcvBufPool.Get().([]byte)[:len(f.Data)]
@@ -167,6 +258,7 @@ func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 				h.lastRcv = data
 			}
 			h.rcvMx.Unlock()
+			h.rcvOutObs.observe(data, dgRcvOutTotal, dgRcvOutOOO)
 			return data, nil
 		}
 		h.rcvMx.Unlock()
