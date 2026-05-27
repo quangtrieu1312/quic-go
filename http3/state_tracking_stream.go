@@ -3,13 +3,24 @@ package http3
 import (
 	"context"
 	"errors"
+	"expvar"
 	"os"
 	"sync"
 
 	"github.com/quic-go/quic-go"
 )
 
-const streamDatagramQueueLen = 32
+const streamDatagramQueueLen = 1024
+
+// Instrumentation for the http3 per-stream datagram receive queue — the layer
+// between quic-go's datagramQueue.Receive and connect-ip's ReadPacket. Drops here
+// are silent client-side download loss, invisible to the quic-layer dg_* counters.
+// h3_stream_dgram_drops counts overflow drops; h3_stream_dgram_highwater is the
+// max observed queue depth (== streamDatagramQueueLen means it saturated).
+var (
+	h3StreamDatagramDrops     = expvar.NewInt("h3_stream_dgram_drops")
+	h3StreamDatagramHighWater = expvar.NewInt("h3_stream_dgram_highwater")
+)
 
 // stateTrackingStream is an implementation of quic.Stream that delegates
 // to an underlying stream
@@ -139,9 +150,13 @@ func (s *stateTrackingStream) enqueueDatagram(data []byte) {
 		return
 	}
 	if len(s.queue) >= streamDatagramQueueLen {
+		h3StreamDatagramDrops.Add(1)
 		return
 	}
 	s.queue = append(s.queue, data)
+	if d := int64(len(s.queue)); d > h3StreamDatagramHighWater.Value() {
+		h3StreamDatagramHighWater.Set(d)
+	}
 	s.signalHasDatagram()
 }
 
