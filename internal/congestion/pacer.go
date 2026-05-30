@@ -1,7 +1,10 @@
 package congestion
 
 import (
+	"expvar"
 	"math"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -19,8 +22,41 @@ const maxBurstSizePackets = 10
 //
 // Tune this to just under the path's bottleneck rate. Too high → bursts still
 // overflow buffers; too low → caps throughput. 0 disables the floor (stock
-// cwnd-derived pacing). Sweep it to find the knee.
-const pacingFloorBytesPerSec = 150 * 1000 * 1000 / 8 // ~150 Mbit/s per connection
+// cwnd-derived pacing). Configurable at startup via TUNNEL_PACING_FLOOR_MBIT
+// (Mbit/s; 0 disables); default ~150 Mbit/s per connection.
+var pacingFloorBytesPerSec uint64 = 150 * 1000 * 1000 / 8
+
+// pacingCeilBytesPerSec is an UPPER bound on the pacer's rate. With congestion
+// control disabled the cwnd-derived bandwidth is effectively infinite, so the
+// pacer never delays — it emits ≤maxBurstSizePackets micro-bursts back-to-back
+// at line rate. AF_XDP TX bypasses the kernel qdisc/fq, so nothing else paces
+// the egress either; the resulting bursts overflow the downstream (e.g. home
+// downlink) buffer → loss → a loss-based remote sender (CUBIC) collapses its
+// cwnd, killing single-stream download. A ceiling re-introduces real pacing
+// (token bucket spaces packets to ~this rate), recovering the smoothing the
+// qdisc would have done. 0 disables (default). Set just under the path's
+// bottleneck via TUNNEL_PACING_CEIL_MBIT (Mbit/s). NOTE: per QUIC connection —
+// with TUNNEL_COUNT=1 this caps ALL flows on that conn, so set it at/above the
+// aggregate downlink you want for P100, while still smoothing single-stream.
+var pacingCeilBytesPerSec uint64 = 0
+
+// quicPacerRateBps exposes the pacer's current send-rate ceiling (bits/s) for
+// diagnostics: when this sits at the floor while throughput is capped, the floor
+// is the bottleneck. Served at /debug/vars.
+var quicPacerRateBps = expvar.NewInt("quic_pacer_rate_bps")
+
+func init() {
+	if v := os.Getenv("TUNNEL_PACING_FLOOR_MBIT"); v != "" {
+		if m, err := strconv.ParseUint(v, 10, 64); err == nil {
+			pacingFloorBytesPerSec = m * 1000 * 1000 / 8
+		}
+	}
+	if v := os.Getenv("TUNNEL_PACING_CEIL_MBIT"); v != "" {
+		if m, err := strconv.ParseUint(v, 10, 64); err == nil {
+			pacingCeilBytesPerSec = m * 1000 * 1000 / 8
+		}
+	}
+}
 
 // The pacer implements a token bucket pacing algorithm.
 type pacer struct {
@@ -44,8 +80,15 @@ func newPacer(getBandwidth func() Bandwidth) *pacer {
 			// Floor the rate so loss-driven cwnd reduction can't throttle the
 			// (congestion-control-disabled) dataplane. See pacingFloorBytesPerSec.
 			if pacingFloorBytesPerSec > 0 && bw < pacingFloorBytesPerSec {
-				return pacingFloorBytesPerSec
+				bw = pacingFloorBytesPerSec
 			}
+			// Cap to the configured ceiling so unpaced (CC-off) bursts can't
+			// overflow the downstream buffer. Applied after the floor; ceiling
+			// wins if both are set.
+			if pacingCeilBytesPerSec > 0 && bw > pacingCeilBytesPerSec {
+				bw = pacingCeilBytesPerSec
+			}
+			quicPacerRateBps.Set(int64(bw * 8))
 			return bw
 		},
 	}

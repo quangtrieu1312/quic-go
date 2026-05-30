@@ -10,6 +10,15 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// streamDatagramQueueLen sits between quic-go's datagramQueue.Receive and
+// connect-ip's ReadPacket. Empirical tuning at P100 -R:
+//   - 1024: ~700 Mbps, ~29k drops (drops are LOSS signals, not reorder — cwnd
+//     backoff keeps the cwnd-ramp aggressive so throughput is higher).
+//   - 4096: 637-686 Mbps, 0 drops, ~26ms bufferbloat (drops vanish but the deeper
+//     queue stalls inner-TCP cwnd ramp; net-negative).
+//   - 16384: ~620 Mbps, same bufferbloat — diminishing returns.
+// 1024 is the sweet spot: best throughput. Reorder is unaffected (this queue is
+// FIFO; only drops change, and a drop is loss not reorder).
 const streamDatagramQueueLen = 1024
 
 // Instrumentation for the http3 per-stream datagram receive queue — the layer

@@ -2,6 +2,7 @@ package ackhandler
 
 import (
 	"errors"
+	"expvar"
 	"fmt"
 	"time"
 
@@ -982,7 +983,35 @@ func (h *sentPacketHandler) PopPacketNumber(encLevel protocol.EncryptionLevel) p
 	return pn
 }
 
-func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
+// SendMode send-decision counters for diagnostics (served at /debug/vars). If
+// quic_sendmode_pacing_limited dominates while throughput is capped, the pacer
+// (its floor) is the bottleneck — not congestion control (cwnd is gated off the
+// dataplane post-handshake) nor the outstanding-packet limit.
+var (
+	smAnyCount    = expvar.NewInt("quic_sendmode_any")
+	smPacingCount = expvar.NewInt("quic_sendmode_pacing_limited")
+	smAckCount    = expvar.NewInt("quic_sendmode_ack")
+	smNoneCount   = expvar.NewInt("quic_sendmode_none")
+	smPTOCount    = expvar.NewInt("quic_sendmode_pto")
+)
+
+func countSendMode(m SendMode) {
+	switch m {
+	case SendAny:
+		smAnyCount.Add(1)
+	case SendPacingLimited:
+		smPacingCount.Add(1)
+	case SendAck:
+		smAckCount.Add(1)
+	case SendNone:
+		smNoneCount.Add(1)
+	default:
+		smPTOCount.Add(1)
+	}
+}
+
+func (h *sentPacketHandler) SendMode(now monotime.Time) (mode SendMode) {
+	defer func() { countSendMode(mode) }()
 	numTrackedPackets := h.appDataPackets.history.Len()
 	if h.initialPackets != nil {
 		numTrackedPackets += h.initialPackets.history.Len()

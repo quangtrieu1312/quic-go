@@ -249,9 +249,15 @@ func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {
 	}
 }
 
+// sendDatagramBufPool recycles the per-packet [QSID varint][payload] buffer.
+// Safe to recycle on return because Conn.SendDatagram copies into its own
+// DatagramFrame.Data before returning (see connection.go:3039 — `f.Data =
+// make(...); copy(f.Data, p)`). At 60k pkt/s × 1260B this was 75 MB/s of GC
+// allocations on the previous TODO path.
+var sendDatagramBufPool = sync.Pool{New: func() any { return make([]byte, 0, 1600) }}
+
 func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
-	// TODO: this creates a lot of garbage and an additional copy
-	data := make([]byte, 0, len(b)+8)
+	data := sendDatagramBufPool.Get().([]byte)[:0]
 	quarterStreamID := uint64(streamID / 4)
 	data = quicvarint.Append(data, uint64(streamID/4))
 	data = append(data, b...)
@@ -264,7 +270,9 @@ func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
 			},
 		})
 	}
-	return c.conn.SendDatagram(data)
+	err := c.conn.SendDatagram(data)
+	sendDatagramBufPool.Put(data[:0])
+	return err
 }
 
 func (c *rawConn) receiveDatagrams() error {
@@ -298,6 +306,10 @@ func (c *rawConn) receiveDatagrams() error {
 		if !ok {
 			continue
 		}
+		// b is f.Data allocated fresh per packet by parseDatagramFrame; safe to
+		// hand a sub-slice to the per-stream queue without copying. The pool-based
+		// recycling that previously made this dangerous has been removed from
+		// datagram_queue.go.
 		dg.enqueueDatagram(b[n:])
 	}
 }

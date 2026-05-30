@@ -39,6 +39,12 @@ type payload struct {
 	frames       []ackhandler.Frame
 	ack          *wire.AckFrame
 	length       protocol.ByteCount
+	// dgramBucket is the datagramQueue bucket idx whose datagrams were packed
+	// into this payload. Zero by default (matches single-bucket / control-only
+	// packets, both of which go to socket 0). The TX path uses this to pick a
+	// pinned TX socket so a flow's frames consistently traverse one socket and
+	// preserve inner-TCP per-flow order (Phase 3 of the fan-out).
+	dgramBucket int
 }
 
 type longHeaderPacket struct {
@@ -58,6 +64,11 @@ type shortHeaderPacket struct {
 	Length               protocol.ByteCount
 	IsPathMTUProbePacket bool
 	IsPathProbePacket    bool
+
+	// DgramBucket: bucket idx of the datagrams packed into this packet (0 if
+	// the packet has no datagrams). The TX path uses this to pick a pinned TX
+	// socket so per-flow ordering is preserved across the multi-socket fan-out.
+	DgramBucket int
 
 	// used for logging
 	DestConnID      protocol.ConnectionID
@@ -134,6 +145,16 @@ type packetPacker struct {
 	retransmissionQueue *retransmissionQueue
 	rand                rand.Rand
 
+	// nextDgramBucket: when datagramQueue.NumBuckets() > 1, the packer rotates
+	// through buckets across packing calls so each bucket gets fair scheduling.
+	// Single-threaded (only the Conn.run packing goroutine touches it), no lock.
+	// At N=1 it stays 0 forever and the rotation collapses to a no-op.
+	nextDgramBucket int
+
+	// genuine-reorder observer for DATAGRAM frames in wire-order (post-shuffle).
+	// One per conn = one packer = one writer; no lock needed.
+	packerObs *dgGenObs
+
 	numNonAckElicitingAcks int
 }
 
@@ -168,6 +189,7 @@ func newPacketPacker(
 		acks:                acks,
 		rand:                *rand.New(rand.NewPCG(binary.BigEndian.Uint64(b[:8]), binary.BigEndian.Uint64(b[8:]))),
 		pnManager:           packetNumberManager,
+		packerObs:           newDgGenObs(),
 	}
 }
 
@@ -651,19 +673,58 @@ func (p *packetPacker) composeNextPacket(
 	}
 
 	if p.datagramQueue != nil {
-		if f := p.datagramQueue.Peek(); f != nil {
-			size := f.Length(v)
-			if size <= maxPayloadSize-pl.length { // DATAGRAM frame fits
-				pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
-				pl.length += size
-				p.datagramQueue.Pop()
-			} else if pl.ack == nil {
-				// The DATAGRAM frame doesn't fit, and the packet doesn't contain an ACK.
-				// Discard this frame. There's no point in retrying this in the next packet,
-				// as it's unlikely that the available packet size will increase.
-				p.datagramQueue.Pop()
+		// Pack as many DATAGRAM frames as fit into this packet. RFC 9221 permits
+		// multiple DATAGRAM frames per QUIC packet. Upstream packs at most one, so a
+		// burst of small inner packets (e.g. TCP ACK floods, sub-MTU traffic) each
+		// pays a full QUIC packet — its own header, AEAD seal, and AF_XDP TX
+		// descriptor. Filling the packet is the GSO-style "carry more per traversal"
+		// win that works under AF_XDP (where kernel UDP_SEGMENT/GSO is unavailable).
+		// Bulk MTU-sized inner packets still take one packet each; the gain is on
+		// mixed/small traffic.
+		//
+		// BUCKETED DRAIN (Phase 3): pick ONE bucket per packet. Frames within a
+		// bucket all hash to the same FlowHash modulus, so consuming an entire
+		// packet's worth from one bucket keeps every flow's frames on the same TX
+		// path. Rotation across packing calls (nextDgramBucket → +1 each time)
+		// fair-shares packets across buckets; if the chosen bucket is empty we
+		// probe forward until we find one with data, then anchor on it. With N=1
+		// (default) this collapses to "always bucket 0" — byte-identical to the
+		// pre-bucketing single-FIFO behavior.
+		numBuckets := p.datagramQueue.NumBuckets()
+		chosenBucket := -1
+		for tries := 0; tries < numBuckets; tries++ {
+			candidate := (p.nextDgramBucket + tries) % numBuckets
+			if p.datagramQueue.PeekBucket(candidate) != nil {
+				chosenBucket = candidate
+				break
 			}
-			// If the DATAGRAM frame was too large and the packet contained an ACK, we'll try to send it out later.
+		}
+		if chosenBucket >= 0 {
+			for {
+				f := p.datagramQueue.PeekBucket(chosenBucket)
+				if f == nil {
+					break
+				}
+				size := f.Length(v)
+				if size <= maxPayloadSize-pl.length { // DATAGRAM frame fits
+					pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
+					pl.length += size
+					p.datagramQueue.PopBucket(chosenBucket)
+					continue
+				}
+				// Doesn't fit. If the packet is still empty (no ACK and no frame packed
+				// yet), this frame is larger than any packet can hold — discard it, as
+				// upstream does, since retrying won't help. Otherwise leave it queued
+				// for the next packet.
+				if pl.ack == nil && len(pl.frames) == 0 {
+					recycleSendDatagramData(f)
+					p.datagramQueue.PopBucket(chosenBucket)
+					continue
+				}
+				break
+			}
+			pl.dgramBucket = chosenBucket
+			p.nextDgramBucket = (chosenBucket + 1) % numBuckets
 		}
 	}
 
@@ -964,14 +1025,53 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 	}
 	// Randomize the order of the control frames.
 	// This makes sure that the receiver doesn't rely on the order in which frames are packed.
+	//
+	// EXCLUDE DATAGRAM frames from the shuffle. The anti-ossification rationale
+	// applies to CONTROL frames (so receivers don't rely on order); DATAGRAM
+	// frames carry inner-IP and the inner-TCP REQUIRES per-flow ordering. With
+	// per-flow packing (above), a single packet may contain multiple DATAGRAMs
+	// from the SAME flow — shuffling them reorders within the flow, which
+	// caused a 1.75% genuine reorder regression at first deploy. We split the
+	// frames into [control, datagram], shuffle only control, then concatenate
+	// control-first (so control still sees randomized order across packets).
 	if len(pl.frames) > 1 {
-		p.rand.Shuffle(len(pl.frames), func(i, j int) { pl.frames[i], pl.frames[j] = pl.frames[j], pl.frames[i] })
+		var control, datagrams []ackhandler.Frame
+		for _, f := range pl.frames {
+			if _, isDg := f.Frame.(*wire.DatagramFrame); isDg {
+				datagrams = append(datagrams, f)
+			} else {
+				control = append(control, f)
+			}
+		}
+		if len(control) > 1 {
+			p.rand.Shuffle(len(control), func(i, j int) { control[i], control[j] = control[j], control[i] })
+		}
+		if len(datagrams) > 0 {
+			pl.frames = append(control, datagrams...)
+		} else {
+			pl.frames = control
+		}
+	}
+	// Observe DATAGRAM frames in their FINAL wire order (post-shuffle, pre-encode).
+	// If dg_packer_genuine ~0% while the receiver tun0 still sees genuine reorder,
+	// the reorder enters after quic-go (send_queue / WriteBatch / AF_XDP TX / wire /
+	// client RX). If dg_packer_genuine matches tun0, the shuffle (or earlier packer
+	// reordering) is the cause — see also the multi-datagram packing loop.
+	for _, f := range pl.frames {
+		if df, ok := f.Frame.(*wire.DatagramFrame); ok {
+			p.packerObs.observe(df.Data, dgPackerTotal, dgPackerGenuine, dgPackerRetr)
+		}
 	}
 	for _, f := range pl.frames {
 		var err error
 		raw, err = f.Frame.Append(raw, v)
 		if err != nil {
 			return nil, err
+		}
+		// Recycle DATAGRAM Data buffer: bytes are now in raw, no further reader
+		// (no FrameHandler attached, qlog reads len only, LogFrame debug-gated).
+		if df, ok := f.Frame.(*wire.DatagramFrame); ok {
+			recycleSendDatagramData(df)
 		}
 	}
 	for _, f := range pl.streamFrames {

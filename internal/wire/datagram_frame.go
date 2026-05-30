@@ -17,6 +17,18 @@ var MaxDatagramSize protocol.ByteCount = 16383
 type DatagramFrame struct {
 	DataLenPresent bool
 	Data           []byte
+	// FlowHash is a STABLE per-inner-flow hash computed at SendDatagram time
+	// (see connection.go) from the [QSID varint][contextID varint][IP packet]
+	// payload's 5-tuple. Used by the packet packer / TX dispatch to route a
+	// flow's frames consistently to one worker, preventing intra-flow reorder
+	// when multiple TX workers run in parallel. Zero on the receive path
+	// (parseDatagramFrame doesn't populate it; recv path doesn't need it).
+	//
+	// CRITICAL: computed once at SendDatagram time and never recomputed.
+	// If f.Data is later recycled into a pool, the bytes there no longer
+	// represent this frame's flow — relying on FlowHash (not re-parsing
+	// f.Data) is what guarantees per-flow worker pinning is stable.
+	FlowHash uint32
 }
 
 func parseDatagramFrame(b []byte, typ FrameType, _ protocol.Version) (*DatagramFrame, int, error) {
