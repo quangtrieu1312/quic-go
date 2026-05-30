@@ -155,6 +155,52 @@ func testStreamsMapOutgoingLimits(t *testing.T, perspective protocol.Perspective
 	})
 }
 
+// This test checks that OpenStreamSync returns the context error when the context is canceled
+// at the same time that the stream limit is increased (see https://github.com/quic-go/quic-go/issues/5659).
+// The race is inherently hard to trigger: even without the fix, this test only fails intermittently.
+// To gain confidence in the fix, run it many times (e.g. 10000 times) with the race detector enabled.
+func TestStreamsMapOutgoingOpenStreamSyncCancel(t *testing.T) {
+	queued := make(chan struct{}, 1)
+	m := newOutgoingStreamsMap(
+		protocol.StreamTypeUni,
+		func(id protocol.StreamID) *mockStream { return &mockStream{id: id} },
+		func(f wire.Frame) { queued <- struct{}{} },
+		protocol.PerspectiveClient,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		str *mockStream
+		err error
+	}
+	resultChan := make(chan result, 1)
+	go func() {
+		str, err := m.OpenStreamSync(ctx)
+		resultChan <- result{str: str, err: err}
+	}()
+
+	select {
+	case <-queued:
+	case <-time.After(time.Second):
+		t.Fatal("OpenStreamSync did not queue")
+	}
+
+	cancel()
+	m.SetMaxStream(protocol.FirstOutgoingUniStreamClient)
+
+	select {
+	case res := <-resultChan:
+		require.ErrorIs(t, res.err, context.Canceled)
+		require.Nil(t, res.str)
+	case <-time.After(time.Second):
+		t.Fatal("OpenStreamSync did not return after the context was canceled")
+	}
+
+	str, err := m.OpenStream()
+	require.NoError(t, err)
+	require.Equal(t, protocol.FirstOutgoingUniStreamClient, str.id)
+}
+
 func TestStreamsMapOutgoingConcurrentOpenStreamSync(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		m := newOutgoingStreamsMap(
@@ -475,7 +521,6 @@ func TestStreamsMapOutgoingRandomizedWithCancellation(t *testing.T) {
 		maxStream := firstStream + 4*(n-1)
 		var limits []protocol.StreamID
 		seen := make(map[protocol.StreamID]struct{})
-		var lastStreamSeen protocol.StreamID
 		var numCancelledSeen int
 		for limit < maxStream {
 			add := 4 * protocol.StreamID(rand.IntN(n/5)+1)
@@ -486,7 +531,8 @@ func TestStreamsMapOutgoingRandomizedWithCancellation(t *testing.T) {
 			t.Logf("setting stream limit to %d", limit)
 			m.SetMaxStream(limit)
 
-			for lastStreamSeen < min(maxStream, limit) {
+			expectedOpened := int((min(maxStream, limit)-firstStream)/4) + 1
+			for len(seen) < expectedOpened {
 				select {
 				case res := <-resultChan:
 					if errors.Is(res.err, context.Canceled) {
@@ -494,8 +540,8 @@ func TestStreamsMapOutgoingRandomizedWithCancellation(t *testing.T) {
 					} else {
 						require.NoError(t, res.err)
 						require.NotContains(t, seen, res.str.id)
+						require.LessOrEqual(t, res.str.id, min(maxStream, limit))
 						seen[res.str.id] = struct{}{}
-						lastStreamSeen = res.str.id
 					}
 				case <-time.After(time.Second):
 					t.Fatalf("timed out waiting for stream to open")
@@ -503,6 +549,15 @@ func TestStreamsMapOutgoingRandomizedWithCancellation(t *testing.T) {
 			}
 		}
 		require.Len(t, seen, n)
+		for numCancelledSeen < numCancelled {
+			select {
+			case res := <-resultChan:
+				require.ErrorIs(t, res.err, context.Canceled)
+				numCancelledSeen++
+			case <-time.After(time.Second):
+				t.Fatalf("timed out waiting for stream opening to be canceled")
+			}
+		}
 		t.Logf("saw %d streams, %d cancelled", len(seen), numCancelledSeen)
 		require.Equal(t, numCancelled, numCancelledSeen)
 
