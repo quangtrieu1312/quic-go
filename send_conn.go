@@ -12,6 +12,7 @@ import (
 type sendConn interface {
 	Write(b []byte, gsoSize uint16, ecn protocol.ECN) error
 	WriteTo([]byte, net.Addr, packetInfo) error
+	WriteBatch(entries []queueEntry) error
 	Close() error
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
@@ -122,3 +123,7 @@ func (c *sconn) ChangeRemoteAddr(addr net.Addr, info packetInfo) {
 
 func (c *sconn) RemoteAddr() net.Addr { return c.remoteAddrInfo.Load().addr }
 func (c *sconn) LocalAddr() net.Addr  { return c.localAddr }
+func (c *sconn) WriteBatch(entries []queueEntry) error {
+	ai := c.remoteAddrInfo.Load()
+    return c.rawConn.WriteBatch(entries, ai.addr, ai.oob)
+}

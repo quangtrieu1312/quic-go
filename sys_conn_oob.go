@@ -5,6 +5,7 @@ package quic
 import (
 	"encoding/binary"
 	"errors"
+	"expvar"
 	"log"
 	"net"
 	"net/netip"
@@ -35,6 +36,7 @@ var _ ipv4.Message = ipv6.Message{}
 
 type batchConn interface {
 	ReadBatch(ms []ipv4.Message, flags int) (int, error)
+	WriteBatch(ms []ipv4.Message, flags int) (int, error)
 }
 
 func inspectReadBuffer(c syscall.RawConn) (int, error) {
@@ -335,4 +337,32 @@ func appendIPv6ECNMsg(b []byte, val protocol.ECN) []byte {
 	offset := startLen + unix.CmsgSpace(0)
 	binary.NativeEndian.PutUint32(b[offset:offset+dataLen], uint32(val.ToHeaderBits()))
 	return b
+}
+
+var (
+	wbSyscalls = expvar.NewInt("qg_wb_syscalls") // # of batchConn.WriteBatch (sendmmsg) calls
+	wbPackets  = expvar.NewInt("qg_wb_packets")  // # of UDP packets sent (GSO segments incl.)
+)
+
+func (c *oobConn) WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error {
+	msgs := make([]ipv4.Message, len(entries))
+	var segs int64
+    for i, e := range entries {
+        oob := baseOOB
+        if e.gsoSize > 0 {
+            oob = appendUDPSegmentSizeMsg(oob, e.gsoSize)
+            segs += int64((len(e.buf.Data) + int(e.gsoSize) - 1) / int(e.gsoSize))
+        } else {
+            segs++
+        }
+        msgs[i] = ipv4.Message{
+            Buffers: [][]byte{e.buf.Data},
+            OOB:     oob,
+            Addr:    addr,
+        }
+    }
+    _, err := c.batchConn.WriteBatch(msgs, 0)  // no type assertion needed
+    wbSyscalls.Add(1)
+    wbPackets.Add(segs)
+    return err
 }

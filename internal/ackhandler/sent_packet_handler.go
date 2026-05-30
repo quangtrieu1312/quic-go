@@ -2,6 +2,7 @@ package ackhandler
 
 import (
 	"errors"
+	"expvar"
 	"fmt"
 	"time"
 
@@ -672,6 +673,7 @@ func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.
 			encLevel = protocol.EncryptionHandshake
 		}
 	}
+	/*
 	if h.handshakeConfirmed && h.appDataPackets.history.HasOutstandingPackets() &&
 		!h.appDataPackets.lastAckElicitingPacketTime.IsZero() {
 		t := h.appDataPackets.lastAckElicitingPacketTime.Add(h.getScaledPTO(true))
@@ -680,6 +682,7 @@ func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.
 			encLevel = protocol.Encryption1RTT
 		}
 	}
+	*/
 	return pto, encLevel
 }
 
@@ -852,9 +855,11 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
 				h.removeFromBytesInFlight(p)
-				h.queueFramesForRetransmission(p)
-				if !p.IsPathMTUProbePacket {
-					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+				if encLevel != protocol.Encryption1RTT {
+					h.queueFramesForRetransmission(p)
+					if !p.IsPathMTUProbePacket {
+						h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+					}
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
@@ -978,7 +983,35 @@ func (h *sentPacketHandler) PopPacketNumber(encLevel protocol.EncryptionLevel) p
 	return pn
 }
 
-func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
+// SendMode send-decision counters for diagnostics (served at /debug/vars). If
+// quic_sendmode_pacing_limited dominates while throughput is capped, the pacer
+// (its floor) is the bottleneck — not congestion control (cwnd is gated off the
+// dataplane post-handshake) nor the outstanding-packet limit.
+var (
+	smAnyCount    = expvar.NewInt("quic_sendmode_any")
+	smPacingCount = expvar.NewInt("quic_sendmode_pacing_limited")
+	smAckCount    = expvar.NewInt("quic_sendmode_ack")
+	smNoneCount   = expvar.NewInt("quic_sendmode_none")
+	smPTOCount    = expvar.NewInt("quic_sendmode_pto")
+)
+
+func countSendMode(m SendMode) {
+	switch m {
+	case SendAny:
+		smAnyCount.Add(1)
+	case SendPacingLimited:
+		smPacingCount.Add(1)
+	case SendAck:
+		smAckCount.Add(1)
+	case SendNone:
+		smNoneCount.Add(1)
+	default:
+		smPTOCount.Add(1)
+	}
+}
+
+func (h *sentPacketHandler) SendMode(now monotime.Time) (mode SendMode) {
+	defer func() { countSendMode(mode) }()
 	numTrackedPackets := h.appDataPackets.history.Len()
 	if h.initialPackets != nil {
 		numTrackedPackets += h.initialPackets.history.Len()
@@ -1005,7 +1038,7 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		return h.ptoMode
 	}
 	// Only send ACKs if we're congestion limited.
-	if !h.congestion.CanSend(h.bytesInFlight) {
+	if !h.handshakeConfirmed && !h.congestion.CanSend(h.bytesInFlight) {
 		if h.logger.Debug() {
 			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, h.congestion.GetCongestionWindow())
 		}
@@ -1017,6 +1050,11 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		}
 		return SendAck
 	}
+	// Pacing stays enabled even after the handshake (unlike the CanSend check
+	// above, which is gated behind !handshakeConfirmed to keep congestion control
+	// off the dataplane). Pacing smooths sends to avoid self-inflicted
+	// buffer-overflow loss; its rate is floored independently of cwnd — see
+	// pacingFloorBytesPerSec in internal/congestion/pacer.go.
 	if !h.congestion.HasPacingBudget(now) {
 		return SendPacingLimited
 	}
@@ -1118,6 +1156,9 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 }
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
+	if h.handshakeConfirmed {
+		return
+	}
 	h.rttStats.ResetForPathMigration()
 	for pn, p := range h.appDataPackets.history.Packets() {
 		h.appDataPackets.history.DeclareLost(pn)
