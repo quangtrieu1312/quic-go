@@ -26,24 +26,20 @@ const maxBurstSizePackets = 10
 // (Mbit/s; 0 disables); default ~150 Mbit/s per connection.
 var pacingFloorBytesPerSec uint64 = 150 * 1000 * 1000 / 8
 
-// pacingCeilBytesPerSec is an UPPER bound on the pacer's rate. With congestion
-// control disabled the cwnd-derived bandwidth is effectively infinite, so the
-// pacer never delays — it emits ≤maxBurstSizePackets micro-bursts back-to-back
-// at line rate. AF_XDP TX bypasses the kernel qdisc/fq, so nothing else paces
-// the egress either; the resulting bursts overflow the downstream (e.g. home
-// downlink) buffer → loss → a loss-based remote sender (CUBIC) collapses its
-// cwnd, killing single-stream download. A ceiling re-introduces real pacing
-// (token bucket spaces packets to ~this rate), recovering the smoothing the
-// qdisc would have done. 0 disables (default). Set just under the path's
-// bottleneck via TUNNEL_PACING_CEIL_MBIT (Mbit/s). NOTE: per QUIC connection —
-// with TUNNEL_COUNT=1 this caps ALL flows on that conn, so set it at/above the
-// aggregate downlink you want for P100, while still smoothing single-stream.
-var pacingCeilBytesPerSec uint64 = 0
-
 // quicPacerRateBps exposes the pacer's current send-rate ceiling (bits/s) for
 // diagnostics: when this sits at the floor while throughput is capped, the floor
 // is the bottleneck. Served at /debug/vars.
 var quicPacerRateBps = expvar.NewInt("quic_pacer_rate_bps")
+
+// maxBurstCapPackets caps the token-bucket max burst (in packets). The default
+// burst = bw×(MinPacingDelay+TimerGranularity) can reach ~150 packets at link
+// rate; since a low-rate single flow sits far under the pacer rate its bucket is
+// always full, so the inner TCP's slow-start bursts egress as line-rate
+// microbursts that overrun a downstream buffer → the rare loss that knocks a
+// single flow out of slow-start (catastrophic under CC-off; invisible for P100).
+// Capping the burst smooths egress. 0 = no cap (stock). Set via
+// TUNNEL_PACING_MAX_BURST_PKTS.
+var maxBurstCapPackets uint64 = 0
 
 func init() {
 	if v := os.Getenv("TUNNEL_PACING_FLOOR_MBIT"); v != "" {
@@ -51,9 +47,9 @@ func init() {
 			pacingFloorBytesPerSec = m * 1000 * 1000 / 8
 		}
 	}
-	if v := os.Getenv("TUNNEL_PACING_CEIL_MBIT"); v != "" {
+	if v := os.Getenv("TUNNEL_PACING_MAX_BURST_PKTS"); v != "" {
 		if m, err := strconv.ParseUint(v, 10, 64); err == nil {
-			pacingCeilBytesPerSec = m * 1000 * 1000 / 8
+			maxBurstCapPackets = m
 		}
 	}
 }
@@ -81,12 +77,6 @@ func newPacer(getBandwidth func() Bandwidth) *pacer {
 			// (congestion-control-disabled) dataplane. See pacingFloorBytesPerSec.
 			if pacingFloorBytesPerSec > 0 && bw < pacingFloorBytesPerSec {
 				bw = pacingFloorBytesPerSec
-			}
-			// Cap to the configured ceiling so unpaced (CC-off) bursts can't
-			// overflow the downstream buffer. Applied after the floor; ceiling
-			// wins if both are set.
-			if pacingCeilBytesPerSec > 0 && bw > pacingCeilBytesPerSec {
-				bw = pacingCeilBytesPerSec
 			}
 			quicPacerRateBps.Set(int64(bw * 8))
 			return bw
@@ -123,10 +113,20 @@ func (p *pacer) Budget(now monotime.Time) protocol.ByteCount {
 }
 
 func (p *pacer) maxBurstSize() protocol.ByteCount {
-	return max(
+	b := max(
 		p.timeScaledBandwidth(uint64((protocol.MinPacingDelay + protocol.TimerGranularity).Nanoseconds())),
 		maxBurstSizePackets*p.maxDatagramSize,
 	)
+	// Optional hard cap on the instantaneous burst to smooth egress (see
+	// maxBurstCapPackets). Floored at maxBurstSizePackets so we never cap below
+	// the stock minimum burst.
+	if maxBurstCapPackets > 0 {
+		cap := protocol.ByteCount(max(maxBurstCapPackets, maxBurstSizePackets)) * p.maxDatagramSize
+		if b > cap {
+			b = cap
+		}
+	}
+	return b
 }
 
 // timeScaledBandwidth calculates the number of bytes that may be sent within
