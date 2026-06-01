@@ -32,6 +32,7 @@ type rawConn interface {
 	// gsoSize is the size of a single packet, or 0 to disable GSO.
 	// It is invalid to set gsoSize if capabilities.GSO is not set.
 	WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN) (int, error)
+	WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error
 	LocalAddr() net.Addr
 	SetReadDeadline(time.Time) error
 	io.Closer
@@ -141,3 +142,23 @@ func (c *basicConn) WritePacket(b []byte, addr net.Addr, _ []byte, gsoSize uint1
 }
 
 func (c *basicConn) capabilities() connCapabilities { return connCapabilities{DF: c.supportsDF} }
+
+func (c *basicConn) WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error {
+	// If underlying conn implements native batch write, use it
+	type nativeBatcher interface {
+    	WriteBatch(pkts [][]byte, addr net.Addr) error
+    }
+    if nb, ok := c.PacketConn.(nativeBatcher); ok {
+        pkts := make([][]byte, len(entries))
+        for i, e := range entries {
+            pkts[i] = e.buf.Data
+        }
+        return nb.WriteBatch(pkts, addr)
+    }
+    for _, e := range entries {
+        if _, err := c.WritePacket(e.buf.Data, addr, baseOOB, e.gsoSize, e.ecn); err != nil {
+            return err
+        }
+    }
+    return nil
+}

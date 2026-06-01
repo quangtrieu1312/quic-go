@@ -556,7 +556,13 @@ func (c *Conn) preSetup() {
 
 	c.receivedPacketHandler = *ackhandler.NewReceivedPacketHandler(c.logger)
 
-	c.datagramQueue = newDatagramQueue(c.scheduleSending, c.logger)
+	// DatagramSendBuckets: see [[wire.DatagramFrame.FlowHash]] and [[xdp.MaximizeChannels]].
+	// Defaults to 1 when unset → byte-identical to pre-bucketing behavior.
+	dgramBuckets := c.config.DatagramSendBuckets
+	if dgramBuckets < 1 {
+		dgramBuckets = 1
+	}
+	c.datagramQueue = newDatagramQueueBucketed(c.scheduleSending, c.logger, dgramBuckets)
 	c.connState.Version = c.version
 }
 
@@ -3036,8 +3042,22 @@ func (c *Conn) SendDatagram(p []byte) error {
 	if protocol.ByteCount(len(p)) > maxDataLen {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
 	}
-	f.Data = make([]byte, len(p))
-	copy(f.Data, p)
+	// f.Data: pool the per-packet buffer. Recycle site is appendPacketPayload's
+	// recycleDatagramData call after f.Append serializes the bytes into the wire
+	// buffer. Falls back to make() when the payload exceeds the pool cap so
+	// oversized outliers don't poison the pool with too-big bufs.
+	buf := sendDatagramDataPool.Get().([]byte)
+	if cap(buf) < len(p) {
+		buf = make([]byte, len(p))
+	} else {
+		buf = buf[:len(p)]
+	}
+	copy(buf, p)
+	f.Data = buf
+	// FlowHash: computed ONCE here from the original payload (still untouched).
+	// The packer / future per-flow TX dispatch reads this field, never re-parses
+	// f.Data — see DatagramFrame.FlowHash comment for the invariant.
+	f.FlowHash = computeFlowHash(p)
 	return c.datagramQueue.Add(f)
 }
 

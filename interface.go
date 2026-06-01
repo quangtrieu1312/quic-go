@@ -172,6 +172,13 @@ type Config struct {
 	Allow0RTT bool
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
+	// DatagramSendBuckets is the number of per-flow buckets the outbound
+	// datagram queue is split into (computed in connection.go as
+	// `f.FlowHash % N`). N=0 or 1 keeps the original single-FIFO behavior.
+	// N>1 is the prerequisite for the per-bucket → per-TX-socket fan-out;
+	// set it equal to the number of NIC combined channels (see
+	// xdp.MaximizeChannels) so each bucket gets its own hardware TX ring.
+	DatagramSendBuckets int
 	// Enable QUIC Stream Resets with Partial Delivery.
 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07.
 	EnableStreamResetPartialDelivery bool

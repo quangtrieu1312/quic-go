@@ -31,7 +31,7 @@ type sendQueue struct {
 
 var _ sender = &sendQueue{}
 
-const sendQueueCapacity = 8
+const sendQueueCapacity = 64
 
 func newSendQueue(conn sendConn) sender {
 	return &sendQueue{
@@ -75,34 +75,48 @@ func (h *sendQueue) Available() <-chan struct{} {
 }
 
 func (h *sendQueue) Run() error {
-	defer close(h.runStopped)
-	var shouldClose bool
-	for {
-		if shouldClose && len(h.queue) == 0 {
-			return nil
-		}
-		select {
-		case <-h.closeCalled:
-			h.closeCalled = nil // prevent this case from being selected again
-			// make sure that all queued packets are actually sent out
-			shouldClose = true
-		case e := <-h.queue:
-			if err := h.conn.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
-				// This additional check enables:
-				// 1. Checking for "datagram too large" message from the kernel, as such,
-				// 2. Path MTU discovery,and
-				// 3. Eventual detection of loss PingFrame.
-				if !isSendMsgSizeErr(err) {
-					return err
-				}
-			}
-			e.buf.Release()
-			select {
-			case h.available <- struct{}{}:
-			default:
-			}
-		}
-	}
+    defer close(h.runStopped)
+    batch := make([]queueEntry, 0, sendQueueCapacity)
+    var shouldClose bool
+    for {
+        if shouldClose && len(h.queue) == 0 {
+            return nil
+        }
+        // Block on first entry
+        select {
+        case <-h.closeCalled:
+            h.closeCalled = nil
+            shouldClose = true
+            continue
+        case e := <-h.queue:
+            batch = append(batch, e)
+        }
+        // Drain remainder non-blocking
+        drainLoop:
+        for len(batch) < sendQueueCapacity {
+            select {
+            case e := <-h.queue:
+                batch = append(batch, e)
+            default:
+                break drainLoop
+            }
+        }
+        // Single batch write
+        if err := h.conn.WriteBatch(batch); err != nil {
+            if !isSendMsgSizeErr(err) {
+                return err
+            }
+        }
+        for i := range batch {
+            batch[i].buf.Release()
+            batch[i] = queueEntry{}
+        }
+        batch = batch[:0]
+        select {
+        case h.available <- struct{}{}:
+        default:
+        }
+    }
 }
 
 func (h *sendQueue) Close() {
