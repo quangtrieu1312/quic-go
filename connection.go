@@ -2597,9 +2597,23 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 	}
 }
 
+// maxGSOSegments is the maximum number of segments the Linux UDP GSO stack
+// accepts in a single sendmsg (UDP_MAX_SEGMENTS). Exceeding it makes the
+// kernel reject the whole datagram with EINVAL.
+const maxGSOSegments = 64
+
 func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 	buf := getLargePacketBuffer()
 	maxSize := c.maxPacketSize()
+
+	// segSize is the size of the FIRST packet appended to the current buffer.
+	// All but the last segment in a UDP_SEGMENT datagram must have this exact
+	// size; only the final segment is allowed to be shorter. We therefore
+	// coalesce packets of uniform size (which may be < maxSize, e.g. a QUIC
+	// packet carrying one MTU-sized DATAGRAM that lands a few bytes under
+	// maxSize) and stop as soon as the size changes.
+	var segSize protocol.ByteCount
+	var numSegments int
 
 	ecn := c.sentPacketHandler.ECNMode(true)
 	for {
@@ -2617,6 +2631,12 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		}
 
 		if !dontSendMore {
+			// Record the segment size from the first packet in this buffer.
+			if numSegments == 0 {
+				segSize = size
+			}
+			numSegments++
+
 			sendMode := c.sentPacketHandler.SendMode(now)
 			if sendMode == ackhandler.SendPacingLimited {
 				c.resetPacingDeadline()
@@ -2631,14 +2651,23 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 
 		// Append another packet if
 		// 1. The congestion controller and pacer allow sending more
-		// 2. The last packet appended was a full-size packet
+		// 2. The last packet appended was exactly segSize. A short packet is
+		//    only valid as the final GSO segment, so it ends the buffer.
 		// 3. The next packet will have the same ECN marking
-		// 4. We still have enough space for another full-size packet in the buffer
-		if !dontSendMore && size == maxSize && nextECN == ecn && buf.Len()+maxSize <= buf.Cap() {
+		// 4. We still have room for another segSize-byte segment in the buffer
+		// 5. We haven't reached the kernel's per-sendmsg segment cap
+		if !dontSendMore && size == segSize && nextECN == ecn &&
+			buf.Len()+segSize <= buf.Cap() && numSegments < maxGSOSegments {
 			continue
 		}
 
-		c.sendQueue.Send(buf, uint16(maxSize), ecn)
+		// gsoSize is the uniform segment size. A single-segment buffer must be
+		// sent with gsoSize=0 to avoid a degenerate UDP_SEGMENT cmsg.
+		gsoSize := uint16(segSize)
+		if numSegments <= 1 {
+			gsoSize = 0
+		}
+		c.sendQueue.Send(buf, gsoSize, ecn)
 
 		if dontSendMore {
 			return nil
@@ -2658,6 +2687,8 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 
 		ecn = nextECN
 		buf = getLargePacketBuffer()
+		segSize = 0
+		numSegments = 0
 	}
 }
 
