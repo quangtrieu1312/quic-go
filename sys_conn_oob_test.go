@@ -294,6 +294,10 @@ func (c *mockBatchConn) ReadBatch(ms []ipv4.Message, _ int) (int, error) {
 	return c.numMsgRead, nil
 }
 
+func (c *mockBatchConn) WriteBatch(ms []ipv4.Message, _ int) (int, error) {
+	return len(ms), nil
+}
+
 func TestReadsMultipleMessagesInOneBatch(t *testing.T) {
 	bc := &mockBatchConn{t: t, numMsgRead: batchSize/2 + 1}
 

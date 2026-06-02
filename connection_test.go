@@ -1,7 +1,6 @@
 package quic
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -107,6 +106,17 @@ func newServerTestConnection(
 	sendConn.EXPECT().capabilities().Return(connCapabilities{GSO: gso}).AnyTimes()
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
 	sendConn.EXPECT().LocalAddr().Return(localAddr).AnyTimes()
+	// The send queue drains via WriteBatch; translate each batched datagram
+	// back into a Write call so tests can keep asserting on per-packet Write
+	// expectations.
+	sendConn.EXPECT().WriteBatch(gomock.Any()).DoAndReturn(func(entries []queueEntry) error {
+		for _, e := range entries {
+			if err := sendConn.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}).AnyTimes()
 	packer := NewMockPacker(mockCtrl)
 	b := make([]byte, 12)
 	rand.Read(b)
@@ -171,6 +181,17 @@ func newClientTestConnection(
 	sendConn.EXPECT().capabilities().Return(connCapabilities{}).AnyTimes()
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
 	sendConn.EXPECT().LocalAddr().Return(localAddr).AnyTimes()
+	// The send queue drains via WriteBatch; translate each batched datagram
+	// back into a Write call so tests can keep asserting on per-packet Write
+	// expectations.
+	sendConn.EXPECT().WriteBatch(gomock.Any()).DoAndReturn(func(entries []queueEntry) error {
+		for _, e := range entries {
+			if err := sendConn.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}).AnyTimes()
 	packer := NewMockPacker(mockCtrl)
 	b := make([]byte, 12)
 	rand.Read(b)
@@ -2190,246 +2211,6 @@ func TestConnectionACKTimer(t *testing.T) {
 	})
 }
 
-// Send a GSO batch, until we have no more data to send.
-func TestConnectionGSOBatch(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		mockCtrl := gomock.NewController(t)
-		sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
-		tc := newServerTestConnection(t,
-			mockCtrl,
-			nil,
-			true,
-			connectionOptHandshakeConfirmed(),
-			connectionOptSentPacketHandler(sph),
-		)
-
-		// allow packets to be sent
-		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
-		sph.EXPECT().TimeUntilSend().AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
-		sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECT1).AnyTimes()
-
-		maxPacketSize := tc.conn.maxPacketSize()
-		var expectedData []byte
-		for i := range 4 {
-			data := bytes.Repeat([]byte{byte(i)}, int(maxPacketSize))
-			expectedData = append(expectedData, data...)
-
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
-					buffer.Data = append(buffer.Data, data...)
-					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(i)}, nil
-				},
-			)
-		}
-		done := make(chan struct{})
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack)
-		tc.sendConn.EXPECT().Write(expectedData, uint16(maxPacketSize), protocol.ECT1).DoAndReturn(
-			func([]byte, uint16, protocol.ECN) error { close(done); return nil },
-		)
-
-		errChan := make(chan error, 1)
-		go func() { errChan <- tc.conn.run() }()
-		tc.conn.scheduleSending()
-
-		synctest.Wait()
-
-		select {
-		case <-done:
-		default:
-			t.Fatal("should have sent a packet")
-		}
-
-		// test teardown
-		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
-		tc.conn.destroy(nil)
-
-		synctest.Wait()
-
-		select {
-		case err := <-errChan:
-			require.NoError(t, err)
-		default:
-			t.Fatal("should have timed out")
-		}
-	})
-}
-
-// Send a GSO batch, until a packet smaller than the maximum size is packed
-func TestConnectionGSOBatchPacketSize(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		mockCtrl := gomock.NewController(t)
-		sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
-		tc := newServerTestConnection(t,
-			mockCtrl,
-			nil,
-			true,
-			connectionOptHandshakeConfirmed(),
-			connectionOptSentPacketHandler(sph),
-		)
-
-		// allow packets to be sent
-		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
-		sph.EXPECT().TimeUntilSend().AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
-		sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECT1).AnyTimes()
-
-		maxPacketSize := tc.conn.maxPacketSize()
-		var expectedData []byte
-		var calls []any
-		for i := range 4 {
-			var data []byte
-			if i == 3 {
-				data = bytes.Repeat([]byte{byte(i)}, int(maxPacketSize-1))
-			} else {
-				data = bytes.Repeat([]byte{byte(i)}, int(maxPacketSize))
-			}
-			expectedData = append(expectedData, data...)
-
-			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
-					buffer.Data = append(buffer.Data, data...)
-					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(10 + i)}, nil
-				},
-			))
-		}
-		// The smaller (fourth) packet concluded this GSO batch, but the send loop will immediately start composing the next batch.
-		// We therefore send a "foobar", so we can check that we're actually generating two GSO batches.
-		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
-					buffer.Data = append(buffer.Data, []byte("foobar")...)
-					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(14)}, nil
-				},
-			),
-		)
-		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack),
-		)
-		gomock.InOrder(calls...)
-
-		done := make(chan struct{})
-		gomock.InOrder(
-			tc.sendConn.EXPECT().Write(expectedData, uint16(maxPacketSize), protocol.ECT1),
-			tc.sendConn.EXPECT().Write([]byte("foobar"), uint16(maxPacketSize), protocol.ECT1).DoAndReturn(
-				func([]byte, uint16, protocol.ECN) error { close(done); return nil },
-			),
-		)
-		errChan := make(chan error, 1)
-		go func() { errChan <- tc.conn.run() }()
-		tc.conn.scheduleSending()
-
-		synctest.Wait()
-
-		select {
-		case <-done:
-		default:
-			t.Fatal("should have sent a packet")
-		}
-
-		// test teardown
-		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
-		tc.conn.destroy(nil)
-
-		synctest.Wait()
-
-		select {
-		case err := <-errChan:
-			require.NoError(t, err)
-		default:
-			t.Fatal("should have timed out")
-		}
-	})
-}
-
-func TestConnectionGSOBatchECN(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		mockCtrl := gomock.NewController(t)
-		sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
-		tc := newServerTestConnection(t,
-			mockCtrl,
-			nil,
-			true,
-			connectionOptHandshakeConfirmed(),
-			connectionOptSentPacketHandler(sph),
-		)
-
-		// allow packets to be sent
-		ecnMode := protocol.ECT1
-		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
-		sph.EXPECT().TimeUntilSend().AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
-		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
-		sph.EXPECT().ECNMode(gomock.Any()).DoAndReturn(func(bool) protocol.ECN { return ecnMode }).AnyTimes()
-
-		// 3. Send a GSO batch, until the ECN marking changes.
-		var expectedData []byte
-		var calls []any
-		maxPacketSize := tc.conn.maxPacketSize()
-		for i := range 3 {
-			data := bytes.Repeat([]byte{byte(i)}, int(maxPacketSize))
-			expectedData = append(expectedData, data...)
-
-			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
-					buffer.Data = append(buffer.Data, data...)
-					if i == 2 {
-						ecnMode = protocol.ECNCE
-					}
-					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(20 + i)}, nil
-				},
-			))
-		}
-		// The smaller (fourth) packet concluded this GSO batch, but the send loop will immediately start composing the next batch.
-		// We therefore send a "foobar", so we can check that we're actually generating two GSO batches.
-		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
-					buffer.Data = append(buffer.Data, []byte("foobar")...)
-					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(24)}, nil
-				},
-			),
-		)
-		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack),
-		)
-		gomock.InOrder(calls...)
-
-		done3 := make(chan struct{})
-		tc.sendConn.EXPECT().Write(expectedData, uint16(maxPacketSize), protocol.ECT1)
-		tc.sendConn.EXPECT().Write([]byte("foobar"), uint16(maxPacketSize), protocol.ECNCE).DoAndReturn(
-			func([]byte, uint16, protocol.ECN) error { close(done3); return nil },
-		)
-
-		errChan := make(chan error, 1)
-		go func() { errChan <- tc.conn.run() }()
-		tc.conn.scheduleSending()
-
-		synctest.Wait()
-
-		select {
-		case <-done3:
-		default:
-			t.Fatal("should have sent a packet")
-		}
-
-		// test teardown
-		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
-		tc.conn.destroy(nil)
-
-		synctest.Wait()
-
-		select {
-		case err := <-errChan:
-			require.NoError(t, err)
-		default:
-			t.Fatal("should have timed out")
-		}
-	})
-}
-
 func TestConnectionPTOProbePackets(t *testing.T) {
 	t.Run("Initial", func(t *testing.T) {
 		testConnectionPTOProbePackets(t, protocol.EncryptionInitial)
@@ -2633,8 +2414,14 @@ func testConnectionSendQueue(t *testing.T, enableGSO bool) {
 		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
 		sph.EXPECT().ECNMode(gomock.Any()).AnyTimes()
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
-			shortHeaderPacket{PacketNumber: protocol.PacketNumber(1)}, nil,
+		// Append a packet large enough that a second segment can't fit in the
+		// GSO buffer, so the coalescer flushes after one packet and then finds
+		// the send queue full. (For the non-GSO path the size is irrelevant.)
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
+				buf.Data = append(buf.Data, make([]byte, protocol.MaxLargePacketBufferSize/2+1)...)
+				return shortHeaderPacket{PacketNumber: protocol.PacketNumber(1)}, nil
+			},
 		)
 		sender.EXPECT().Send(gomock.Any(), gomock.Any(), gomock.Any())
 

@@ -139,6 +139,17 @@ type Conn struct {
 	conn      sendConn
 	sendQueue sender
 
+	// gsoStash holds a short-header packet that was packed (and therefore
+	// already registered as sent) during a previous sendPacketsWithGSO call
+	// but could not be appended to that call's GSO buffer because it was
+	// larger than the buffer's segment size. It could not be enqueued at the
+	// time because the send queue was full. It must be flushed first on the
+	// next send, before any newly packed packets, so its packet number stays
+	// in order on the wire. Only accessed from the run goroutine.
+	gsoStash     *packetBuffer
+	gsoStashSize protocol.ByteCount
+	gsoStashECN  protocol.ECN
+
 	// lazily initialzed: most connections never migrate
 	pathManager         *pathManager
 	largestRcvdAppData  protocol.PacketNumber
@@ -750,6 +761,10 @@ runLoop:
 	closeErr := c.closeErr.Load()
 	c.cryptoStreamHandler.Close()
 	c.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
+	if c.gsoStash != nil {
+		c.gsoStash.Release()
+		c.gsoStash = nil
+	}
 	c.handleCloseError(closeErr)
 	if c.qlogger != nil {
 		if e := (&errCloseForRecreating{}); !errors.As(closeErr.err, &e) {
@@ -2603,21 +2618,40 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 const maxGSOSegments = 64
 
 func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
-	buf := getLargePacketBuffer()
 	maxSize := c.maxPacketSize()
 
 	// segSize is the size of the FIRST packet appended to the current buffer.
 	// All but the last segment in a UDP_SEGMENT datagram must have this exact
-	// size; only the final segment is allowed to be shorter. We therefore
-	// coalesce packets of uniform size (which may be < maxSize, e.g. a QUIC
-	// packet carrying one MTU-sized DATAGRAM that lands a few bytes under
-	// maxSize) and stop as soon as the size changes.
+	// size; the final segment is only allowed to be shorter (never longer).
+	// We therefore coalesce packets of uniform size (which may be < maxSize,
+	// e.g. a QUIC packet carrying one MTU-sized DATAGRAM that lands a few
+	// bytes under maxSize) and flush as soon as the size changes.
 	var segSize protocol.ByteCount
 	var numSegments int
 
 	ecn := c.sentPacketHandler.ECNMode(true)
+
+	// A previous call may have packed a packet it couldn't fit into that
+	// call's GSO buffer and couldn't enqueue (the send queue was full); it was
+	// stashed so it goes out first now, before any newly packed packets, with
+	// its original packet number ordering preserved.
+	var buf *packetBuffer
+	if c.gsoStash != nil {
+		buf = c.gsoStash
+		segSize = c.gsoStashSize
+		ecn = c.gsoStashECN
+		numSegments = 1
+		c.gsoStash = nil
+	} else {
+		buf = getLargePacketBuffer()
+	}
+
 	for {
 		var dontSendMore bool
+		// prevLen marks where the next packet begins in buf, so that if the
+		// packet turns out to be larger than segSize (which would make it an
+		// illegal oversize trailing GSO segment) we can detach it again.
+		prevLen := buf.Len()
 		size, err := c.appendOneShortHeaderPacket(buf, maxSize, ecn, now)
 		if err != nil {
 			if err != errNothingToPack {
@@ -2630,12 +2664,34 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 			dontSendMore = true
 		}
 
+		// carry holds a packet that was just packed into buf but is larger
+		// than segSize and therefore cannot be a (non-final) segment of this
+		// buffer. It has already been registered as sent, so it must still be
+		// transmitted: we move it into its own buffer and flush buf now.
+		var carry *packetBuffer
+		var carrySize protocol.ByteCount
+
 		if !dontSendMore {
-			// Record the segment size from the first packet in this buffer.
-			if numSegments == 0 {
+			switch {
+			case numSegments == 0:
+				// First packet in this buffer establishes the segment size.
 				segSize = size
+				numSegments = 1
+			case size <= segSize:
+				// Same size keeps the run going; a smaller packet is a valid
+				// final segment (the continue check below ends the buffer).
+				numSegments++
+			default:
+				// size > segSize: appending this packet would make it an
+				// oversize trailing segment (kernel rejects the whole
+				// UDP_SEGMENT sendmsg with EINVAL). Detach it from buf and
+				// flush buf without it; numSegments is unchanged (it still
+				// counts only the segSize-sized prefix segments).
+				carry = getLargePacketBuffer()
+				carry.Data = append(carry.Data, buf.Data[prevLen:]...)
+				carrySize = size
+				buf.Data = buf.Data[:prevLen]
 			}
-			numSegments++
 
 			sendMode := c.sentPacketHandler.SendMode(now)
 			if sendMode == ackhandler.SendPacingLimited {
@@ -2650,13 +2706,14 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		nextECN := c.sentPacketHandler.ECNMode(true)
 
 		// Append another packet if
-		// 1. The congestion controller and pacer allow sending more
-		// 2. The last packet appended was exactly segSize. A short packet is
+		// 1. We didn't just detach an oversize packet
+		// 2. The congestion controller and pacer allow sending more
+		// 3. The last packet appended was exactly segSize. A short packet is
 		//    only valid as the final GSO segment, so it ends the buffer.
-		// 3. The next packet will have the same ECN marking
-		// 4. We still have room for another segSize-byte segment in the buffer
-		// 5. We haven't reached the kernel's per-sendmsg segment cap
-		if !dontSendMore && size == segSize && nextECN == ecn &&
+		// 4. The next packet will have the same ECN marking
+		// 5. We still have room for another segSize-byte segment in the buffer
+		// 6. We haven't reached the kernel's per-sendmsg segment cap
+		if carry == nil && !dontSendMore && size == segSize && nextECN == ecn &&
 			buf.Len()+segSize <= buf.Cap() && numSegments < maxGSOSegments {
 			continue
 		}
@@ -2668,6 +2725,20 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 			gsoSize = 0
 		}
 		c.sendQueue.Send(buf, gsoSize, ecn)
+
+		// Flush the detached oversize packet as its own datagram. If the send
+		// queue just filled up we can't enqueue it now; stash it (already
+		// registered, must not be dropped) for the next call, which the run
+		// loop only enters once there's space again.
+		if carry != nil {
+			if c.sendQueue.WouldBlock() {
+				c.gsoStash = carry
+				c.gsoStashSize = carrySize
+				c.gsoStashECN = ecn
+				return nil
+			}
+			c.sendQueue.Send(carry, 0, ecn)
+		}
 
 		if dontSendMore {
 			return nil
