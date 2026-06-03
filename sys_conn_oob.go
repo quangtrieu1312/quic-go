@@ -342,13 +342,23 @@ func appendIPv6ECNMsg(b []byte, val protocol.ECN) []byte {
 var (
 	wbSyscalls = expvar.NewInt("qg_wb_syscalls") // # of batchConn.WriteBatch (sendmmsg) calls
 	wbPackets  = expvar.NewInt("qg_wb_packets")  // # of UDP packets sent (GSO segments incl.)
+	wbShort    = expvar.NewInt("qg_wb_short")    // # of messages sendmmsg did NOT send (silent loss)
 )
 
 func (c *oobConn) WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte) error {
 	msgs := make([]ipv4.Message, len(entries))
 	var segs int64
+	// CRITICAL: each message needs its OWN OOB backing. appendUDPSegmentSizeMsg
+	// writes the UDP_SEGMENT cmsg into baseOOB's spare capacity IN PLACE, so
+	// reusing baseOOB across entries makes every msg.OOB alias the same memory
+	// and inherit the LAST entry's gsoSize. A batch that mixes gsoSizes (a GSO
+	// super-buffer + a carry/stash single + an ACK) then gets mis-segmented or
+	// EINVAL-rejected by the kernel — silent loss invisible to every counter.
+	// Give each entry a disjoint region of one per-call backing buffer.
+	per := len(baseOOB) + 64
+	oobBuf := make([]byte, per*len(entries))
     for i, e := range entries {
-        oob := baseOOB
+        oob := append(oobBuf[i*per:i*per:(i+1)*per], baseOOB...)
         if e.gsoSize > 0 {
             oob = appendUDPSegmentSizeMsg(oob, e.gsoSize)
             segs += int64((len(e.buf.Data) + int(e.gsoSize) - 1) / int(e.gsoSize))
@@ -361,8 +371,13 @@ func (c *oobConn) WriteBatch(entries []queueEntry, addr net.Addr, baseOOB []byte
             Addr:    addr,
         }
     }
-    _, err := c.batchConn.WriteBatch(msgs, 0)  // no type assertion needed
+    n, err := c.batchConn.WriteBatch(msgs, 0)  // no type assertion needed
     wbSyscalls.Add(1)
     wbPackets.Add(segs)
+    // sendmmsg returns the count actually accepted; the rest are dropped on the
+    // floor (not retried). Count them so this loss stops being invisible.
+    if err == nil && n >= 0 && n < len(msgs) {
+        wbShort.Add(int64(len(msgs) - n))
+    }
     return err
 }
