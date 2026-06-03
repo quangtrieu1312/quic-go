@@ -4,6 +4,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/congestion"
@@ -15,6 +16,16 @@ import (
 	"github.com/quic-go/quic-go/qlog"
 	"github.com/quic-go/quic-go/qlogwriter"
 )
+
+// ccEnabled re-enables the STOCK quic-go congestion control on the dataplane.
+// The fork runs CC-OFF by default (the cwnd gate in SendMode is bypassed
+// post-handshake) to avoid double-CC with the inner TCP — but CC-off also leaves
+// cwnd unbounded, which makes the pacer's burst unbounded → self-inflicted
+// microburst loss (~2-4%). With CC ON, cwnd is bounded, so the pacer paces
+// properly (small bursts) AND the sender backs off on loss. Opt in with
+// TUNNEL_ENABLE_CC=1; pair with TUNNEL_PACING_FLOOR_MBIT=0 so the pacer rate is
+// fully cwnd-driven (stock) rather than floored.
+var ccEnabled = os.Getenv("TUNNEL_ENABLE_CC") == "1"
 
 const (
 	// Maximum reordering in time space before time based loss detection considers a packet lost.
@@ -1037,8 +1048,10 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) (mode SendMode) {
 	if h.numProbesToSend > 0 {
 		return h.ptoMode
 	}
-	// Only send ACKs if we're congestion limited.
-	if !h.handshakeConfirmed && !h.congestion.CanSend(h.bytesInFlight) {
+	// Only send ACKs if we're congestion limited. The cwnd gate is normally
+	// bypassed post-handshake (CC-off dataplane); TUNNEL_ENABLE_CC=1 restores
+	// stock congestion control (gate applies always).
+	if (ccEnabled || !h.handshakeConfirmed) && !h.congestion.CanSend(h.bytesInFlight) {
 		if h.logger.Debug() {
 			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, h.congestion.GetCongestionWindow())
 		}
