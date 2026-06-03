@@ -36,3 +36,6 @@ func parseIPv4PktInfo(body []byte) (ip netip.Addr, ifIndex uint32, ok bool) {
 func isGSOEnabled(syscall.RawConn) bool { return false }
 
 func isECNEnabled() bool { return !isECNDisabledUsingEnv() }
+
+// setMaxPacingRate is a no-op off Linux (SO_MAX_PACING_RATE + fq pacing is Linux-only).
+func setMaxPacingRate(syscall.RawConn, uint64) error { return nil }

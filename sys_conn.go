@@ -75,6 +75,24 @@ func wrapConn(pc net.PacketConn) (rawConn, error) {
 		}
 	}
 
+	// CC-off proper pacing: ask the kernel `fq` qdisc to pace this socket's egress
+	// at a fixed rate so GSO super-buffers leave the wire as a steady stream
+	// instead of line-rate microbursts (which a shallow fabric queue drops →
+	// self-inflicted inner-TCP loss; the SAME fabric carries smooth TCP at line
+	// rate with zero loss). Unlike a userspace burst cap this keeps full GSO.
+	// Opt in via TUNNEL_SO_MAX_PACING_MBIT (Mbit/s); requires `fq` on the egress.
+	if v := os.Getenv("TUNNEL_SO_MAX_PACING_MBIT"); v != "" {
+		if mbit, perr := strconv.ParseUint(v, 10, 64); perr == nil && mbit > 0 {
+			if sc, okp := pc.(interface {
+				SyscallConn() (syscall.RawConn, error)
+			}); okp {
+				if rc, cerr := sc.SyscallConn(); cerr == nil {
+					_ = setMaxPacingRate(rc, mbit*1000*1000/8)
+				}
+			}
+		}
+	}
+
 	conn, ok := pc.(interface {
 		SyscallConn() (syscall.RawConn, error)
 	})

@@ -49,6 +49,30 @@ func forceSetSendBuffer(c syscall.RawConn, bytes int) error {
 	return serr
 }
 
+// soMaxPacingRate is SO_MAX_PACING_RATE (linux, SOL_SOCKET). Not always exported
+// by x/sys, so use the constant directly.
+const soMaxPacingRate = 0x2f // 47
+
+// setMaxPacingRate sets SO_MAX_PACING_RATE so the `fq` qdisc paces this socket's
+// egress smoothly at bytesPerSec. This is the CC-off "proper pacing": it spreads
+// GSO super-buffers into a steady stream on the wire instead of line-rate
+// microbursts (which a shallow fabric queue drops), WITHOUT shrinking the GSO
+// batch — so we keep both low loss AND syscall efficiency, unlike a userspace
+// burst cap. Requires `fq` on the egress (fq_codel does not pace per-socket).
+func setMaxPacingRate(c syscall.RawConn, bytesPerSec uint64) error {
+	rate := bytesPerSec
+	if rate > 0xffffffff { // SO_MAX_PACING_RATE is u32 bytes/s
+		rate = 0xffffffff
+	}
+	var serr error
+	if err := c.Control(func(fd uintptr) {
+		serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, soMaxPacingRate, int(rate))
+	}); err != nil {
+		return err
+	}
+	return serr
+}
+
 func parseIPv4PktInfo(body []byte) (ip netip.Addr, ifIndex uint32, ok bool) {
 	// struct in_pktinfo {
 	// 	unsigned int   ipi_ifindex;  /* Interface index */

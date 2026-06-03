@@ -31,14 +31,25 @@ var pacingFloorBytesPerSec uint64 = 150 * 1000 * 1000 / 8
 // is the bottleneck. Served at /debug/vars.
 var quicPacerRateBps = expvar.NewInt("quic_pacer_rate_bps")
 
-// maxBurstCapPackets caps the token-bucket max burst (in packets). The default
-// burst = bw×(MinPacingDelay+TimerGranularity) can reach ~150 packets at link
-// rate; since a low-rate single flow sits far under the pacer rate its bucket is
-// always full, so the inner TCP's slow-start bursts egress as line-rate
-// microbursts that overrun a downstream buffer → the rare loss that knocks a
-// single flow out of slow-start (catastrophic under CC-off; invisible for P100).
-// Capping the burst smooths egress. 0 = no cap (stock). Set via
-// TUNNEL_PACING_MAX_BURST_PKTS.
+// maxBurstCapPackets caps the token-bucket max burst (in packets). This is the
+// ONLY egress shaper under the CC-off dataplane invariant: with congestion
+// control disabled the cwnd (and hence the pacing RATE) still tracks the
+// bottleneck fine, but the stock max burst = bw×(MinPacingDelay+TimerGranularity)
+// reaches ~150 packets at link rate. With the bucket sitting full, the inner
+// TCP's bursts egress as line-rate microbursts that overrun a shallow fabric/NIC
+// queue — measured as ~2% inner-TCP retransmits even though the SAME fabric
+// carries smooth TCP at 22 Gbit/s with ZERO loss (so the loss is self-inflicted
+// burstiness, not the underlay). Bounding the burst to a few MSS spreads the
+// send (the pacer is continuous-time, so throughput = rate is preserved; only
+// the instantaneous burst shrinks).
+//
+// Default 0 (uncapped/stock). Capping smooths egress but is COUPLED to the GSO
+// batch size, so it trades throughput for loss (burst=4 → 0 loss but ~1.5G,
+// syscall-bound; uncapped → ~3.2G but ~4% loss). There is no value that gives
+// both, so this stays off by default and is exposed only as a tuning knob via
+// TUNNEL_PACING_MAX_BURST_PKTS (now honored below the stock 10-packet floor).
+// Kernel SO_MAX_PACING_RATE + fq (TUNNEL_SO_MAX_PACING_MBIT) was also tried and
+// does NOT help: above the flow rate it doesn't engage, below it fq queue-drops.
 var maxBurstCapPackets uint64 = 0
 
 func init() {
@@ -117,11 +128,17 @@ func (p *pacer) maxBurstSize() protocol.ByteCount {
 		p.timeScaledBandwidth(uint64((protocol.MinPacingDelay + protocol.TimerGranularity).Nanoseconds())),
 		maxBurstSizePackets*p.maxDatagramSize,
 	)
-	// Optional hard cap on the instantaneous burst to smooth egress (see
-	// maxBurstCapPackets). Floored at maxBurstSizePackets so we never cap below
-	// the stock minimum burst.
+	// Hard cap on the instantaneous burst to smooth egress (see maxBurstCapPackets).
+	// Honor the configured value EVEN BELOW the stock maxBurstSizePackets floor:
+	// under CC-off the pacer is the only shaper, and the whole point is to allow a
+	// burst smaller than stock. Clamped to >=2 MSS so a 1-packet pathology can't
+	// stall a GSO super-packet that is itself multiple segments.
 	if maxBurstCapPackets > 0 {
-		cap := protocol.ByteCount(max(maxBurstCapPackets, maxBurstSizePackets)) * p.maxDatagramSize
+		capPkts := maxBurstCapPackets
+		if capPkts < 2 {
+			capPkts = 2
+		}
+		cap := protocol.ByteCount(capPkts) * p.maxDatagramSize
 		if b > cap {
 			b = cap
 		}
