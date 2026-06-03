@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,14 @@ import (
 	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/qlog"
 	"github.com/quic-go/quic-go/qlogwriter"
+)
+
+// Received-packet drop counters (diagnostic). A non-trivial rate here means WE
+// are putting malformed/undecryptable packets on the wire (e.g. GSO mis-
+// segmentation) — the wire itself does not corrupt. Served at /debug/vars.
+var (
+	quicRxUndecryptable = expvar.NewInt("quic_rx_undecryptable") // AEAD decryption failed
+	quicRxHdrDrop       = expvar.NewInt("quic_rx_hdr_drop")      // header could not be parsed
 )
 
 type unpacker interface {
@@ -1452,6 +1461,7 @@ func (c *Conn) handleUnpackError(err error, p receivedPacket, pt qlog.PacketType
 				Trigger:    qlog.PacketDropPayloadDecryptError,
 			})
 		}
+		quicRxUndecryptable.Add(1)
 		c.logger.Debugf("Dropping %s packet (%d bytes) that could not be unpacked. Error: %s", pt, p.Size(), err)
 		return false, nil
 	default:
@@ -1471,6 +1481,7 @@ func (c *Conn) handleUnpackError(err error, p receivedPacket, pt qlog.PacketType
 					Trigger:    qlog.PacketDropHeaderParseError,
 				})
 			}
+			quicRxHdrDrop.Add(1)
 			c.logger.Debugf("Dropping %s packet (%d bytes) for which we couldn't unpack the header. Error: %s", pt, p.Size(), err)
 			return false, nil
 		}
