@@ -2722,10 +2722,16 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		// 3. The last packet appended was exactly segSize. A short packet is
 		//    only valid as the final GSO segment, so it ends the buffer.
 		// 4. The next packet will have the same ECN marking
-		// 5. We still have room for another segSize-byte segment in the buffer
+		// 5. There is room for the WORST-CASE next packet (maxSize, not segSize)
 		// 6. We haven't reached the kernel's per-sendmsg segment cap
+		//
+		// (5) must reserve maxSize, not segSize: appendOneShortHeaderPacket can
+		// emit up to maxSize bytes, so when an earlier packet established a
+		// segSize < maxSize (common at small MTUs), a following maxSize packet
+		// would overflow buf before it can be detached as `carry` — panic:
+		// "slice bounds out of range". maxSize is MTU-derived, never hardcoded.
 		if carry == nil && !dontSendMore && size == segSize && nextECN == ecn &&
-			buf.Len()+segSize <= buf.Cap() && numSegments < maxGSOSegments {
+			buf.Len()+maxSize <= buf.Cap() && numSegments < maxGSOSegments {
 			continue
 		}
 
