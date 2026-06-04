@@ -21,11 +21,26 @@ func getPacketWithContents(b []byte) *packetBuffer {
 	return buf
 }
 
+// forwardWriteBatch makes the mock send connection translate each batched
+// datagram (the queue drains via WriteBatch) back into a Write call, so tests
+// can keep asserting on per-packet Write expectations.
+func forwardWriteBatch(c *MockSendConn) {
+	c.EXPECT().WriteBatch(gomock.Any()).DoAndReturn(func(entries []queueEntry) error {
+		for _, e := range entries {
+			if err := c.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
+				return err
+			}
+		}
+		return nil
+	}).AnyTimes()
+}
+
 func TestSendQueueSendOnePacket(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
 		c := NewMockSendConn(mockCtrl)
 		q := newSendQueue(c)
+		forwardWriteBatch(c)
 
 		written := make(chan struct{})
 		c.EXPECT().Write([]byte("foobar"), uint16(10), protocol.ECT1).Do(
@@ -63,6 +78,7 @@ func TestSendQueueBlocking(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
 		c := NewMockSendConn(mockCtrl)
 		q := newSendQueue(c)
+		forwardWriteBatch(c)
 
 		blockWrite := make(chan struct{})
 		written := make(chan struct{}, 1)
@@ -156,6 +172,7 @@ func TestSendQueueWriteError(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
 		c := NewMockSendConn(mockCtrl)
 		q := newSendQueue(c)
+		forwardWriteBatch(c)
 
 		c.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()).Return(assert.AnError)
 		q.Send(getPacketWithContents([]byte("foobar")), 6, protocol.ECNNon)

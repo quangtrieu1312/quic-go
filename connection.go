@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,14 @@ import (
 	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/qlog"
 	"github.com/quic-go/quic-go/qlogwriter"
+)
+
+// Received-packet drop counters (diagnostic). A non-trivial rate here means WE
+// are putting malformed/undecryptable packets on the wire (e.g. GSO mis-
+// segmentation) — the wire itself does not corrupt. Served at /debug/vars.
+var (
+	quicRxUndecryptable = expvar.NewInt("quic_rx_undecryptable") // AEAD decryption failed
+	quicRxHdrDrop       = expvar.NewInt("quic_rx_hdr_drop")      // header could not be parsed
 )
 
 type unpacker interface {
@@ -138,6 +147,17 @@ type Conn struct {
 
 	conn      sendConn
 	sendQueue sender
+
+	// gsoStash holds a short-header packet that was packed (and therefore
+	// already registered as sent) during a previous sendPacketsWithGSO call
+	// but could not be appended to that call's GSO buffer because it was
+	// larger than the buffer's segment size. It could not be enqueued at the
+	// time because the send queue was full. It must be flushed first on the
+	// next send, before any newly packed packets, so its packet number stays
+	// in order on the wire. Only accessed from the run goroutine.
+	gsoStash     *packetBuffer
+	gsoStashSize protocol.ByteCount
+	gsoStashECN  protocol.ECN
 
 	// lazily initialzed: most connections never migrate
 	pathManager         *pathManager
@@ -750,6 +770,10 @@ runLoop:
 	closeErr := c.closeErr.Load()
 	c.cryptoStreamHandler.Close()
 	c.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
+	if c.gsoStash != nil {
+		c.gsoStash.Release()
+		c.gsoStash = nil
+	}
 	c.handleCloseError(closeErr)
 	if c.qlogger != nil {
 		if e := (&errCloseForRecreating{}); !errors.As(closeErr.err, &e) {
@@ -1437,6 +1461,7 @@ func (c *Conn) handleUnpackError(err error, p receivedPacket, pt qlog.PacketType
 				Trigger:    qlog.PacketDropPayloadDecryptError,
 			})
 		}
+		quicRxUndecryptable.Add(1)
 		c.logger.Debugf("Dropping %s packet (%d bytes) that could not be unpacked. Error: %s", pt, p.Size(), err)
 		return false, nil
 	default:
@@ -1456,6 +1481,7 @@ func (c *Conn) handleUnpackError(err error, p receivedPacket, pt qlog.PacketType
 					Trigger:    qlog.PacketDropHeaderParseError,
 				})
 			}
+			quicRxHdrDrop.Add(1)
 			c.logger.Debugf("Dropping %s packet (%d bytes) for which we couldn't unpack the header. Error: %s", pt, p.Size(), err)
 			return false, nil
 		}
@@ -2597,13 +2623,46 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 	}
 }
 
+// maxGSOSegments is the maximum number of segments the Linux UDP GSO stack
+// accepts in a single sendmsg (UDP_MAX_SEGMENTS). Exceeding it makes the
+// kernel reject the whole datagram with EINVAL.
+const maxGSOSegments = 64
+
 func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
-	buf := getLargePacketBuffer()
 	maxSize := c.maxPacketSize()
 
+	// segSize is the size of the FIRST packet appended to the current buffer.
+	// All but the last segment in a UDP_SEGMENT datagram must have this exact
+	// size; the final segment is only allowed to be shorter (never longer).
+	// We therefore coalesce packets of uniform size (which may be < maxSize,
+	// e.g. a QUIC packet carrying one MTU-sized DATAGRAM that lands a few
+	// bytes under maxSize) and flush as soon as the size changes.
+	var segSize protocol.ByteCount
+	var numSegments int
+
 	ecn := c.sentPacketHandler.ECNMode(true)
+
+	// A previous call may have packed a packet it couldn't fit into that
+	// call's GSO buffer and couldn't enqueue (the send queue was full); it was
+	// stashed so it goes out first now, before any newly packed packets, with
+	// its original packet number ordering preserved.
+	var buf *packetBuffer
+	if c.gsoStash != nil {
+		buf = c.gsoStash
+		segSize = c.gsoStashSize
+		ecn = c.gsoStashECN
+		numSegments = 1
+		c.gsoStash = nil
+	} else {
+		buf = getLargePacketBuffer()
+	}
+
 	for {
 		var dontSendMore bool
+		// prevLen marks where the next packet begins in buf, so that if the
+		// packet turns out to be larger than segSize (which would make it an
+		// illegal oversize trailing GSO segment) we can detach it again.
+		prevLen := buf.Len()
 		size, err := c.appendOneShortHeaderPacket(buf, maxSize, ecn, now)
 		if err != nil {
 			if err != errNothingToPack {
@@ -2616,7 +2675,35 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 			dontSendMore = true
 		}
 
+		// carry holds a packet that was just packed into buf but is larger
+		// than segSize and therefore cannot be a (non-final) segment of this
+		// buffer. It has already been registered as sent, so it must still be
+		// transmitted: we move it into its own buffer and flush buf now.
+		var carry *packetBuffer
+		var carrySize protocol.ByteCount
+
 		if !dontSendMore {
+			switch {
+			case numSegments == 0:
+				// First packet in this buffer establishes the segment size.
+				segSize = size
+				numSegments = 1
+			case size <= segSize:
+				// Same size keeps the run going; a smaller packet is a valid
+				// final segment (the continue check below ends the buffer).
+				numSegments++
+			default:
+				// size > segSize: appending this packet would make it an
+				// oversize trailing segment (kernel rejects the whole
+				// UDP_SEGMENT sendmsg with EINVAL). Detach it from buf and
+				// flush buf without it; numSegments is unchanged (it still
+				// counts only the segSize-sized prefix segments).
+				carry = getLargePacketBuffer()
+				carry.Data = append(carry.Data, buf.Data[prevLen:]...)
+				carrySize = size
+				buf.Data = buf.Data[:prevLen]
+			}
+
 			sendMode := c.sentPacketHandler.SendMode(now)
 			if sendMode == ackhandler.SendPacingLimited {
 				c.resetPacingDeadline()
@@ -2630,15 +2717,45 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 		nextECN := c.sentPacketHandler.ECNMode(true)
 
 		// Append another packet if
-		// 1. The congestion controller and pacer allow sending more
-		// 2. The last packet appended was a full-size packet
-		// 3. The next packet will have the same ECN marking
-		// 4. We still have enough space for another full-size packet in the buffer
-		if !dontSendMore && size == maxSize && nextECN == ecn && buf.Len()+maxSize <= buf.Cap() {
+		// 1. We didn't just detach an oversize packet
+		// 2. The congestion controller and pacer allow sending more
+		// 3. The last packet appended was exactly segSize. A short packet is
+		//    only valid as the final GSO segment, so it ends the buffer.
+		// 4. The next packet will have the same ECN marking
+		// 5. There is room for the WORST-CASE next packet (maxSize, not segSize)
+		// 6. We haven't reached the kernel's per-sendmsg segment cap
+		//
+		// (5) must reserve maxSize, not segSize: appendOneShortHeaderPacket can
+		// emit up to maxSize bytes, so when an earlier packet established a
+		// segSize < maxSize (common at small MTUs), a following maxSize packet
+		// would overflow buf before it can be detached as `carry` — panic:
+		// "slice bounds out of range". maxSize is MTU-derived, never hardcoded.
+		if carry == nil && !dontSendMore && size == segSize && nextECN == ecn &&
+			buf.Len()+maxSize <= buf.Cap() && numSegments < maxGSOSegments {
 			continue
 		}
 
-		c.sendQueue.Send(buf, uint16(maxSize), ecn)
+		// gsoSize is the uniform segment size. A single-segment buffer must be
+		// sent with gsoSize=0 to avoid a degenerate UDP_SEGMENT cmsg.
+		gsoSize := uint16(segSize)
+		if numSegments <= 1 {
+			gsoSize = 0
+		}
+		c.sendQueue.Send(buf, gsoSize, ecn)
+
+		// Flush the detached oversize packet as its own datagram. If the send
+		// queue just filled up we can't enqueue it now; stash it (already
+		// registered, must not be dropped) for the next call, which the run
+		// loop only enters once there's space again.
+		if carry != nil {
+			if c.sendQueue.WouldBlock() {
+				c.gsoStash = carry
+				c.gsoStashSize = carrySize
+				c.gsoStashECN = ecn
+				return nil
+			}
+			c.sendQueue.Send(carry, 0, ecn)
+		}
 
 		if dontSendMore {
 			return nil
@@ -2658,6 +2775,8 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 
 		ecn = nextECN
 		buf = getLargePacketBuffer()
+		segSize = 0
+		numSegments = 0
 	}
 }
 

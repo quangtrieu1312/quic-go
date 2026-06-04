@@ -229,6 +229,44 @@ func (c *MockSendConnWriteCall) DoAndReturn(f func([]byte, uint16, protocol.ECN)
 	return c
 }
 
+// WriteBatch mocks base method.
+func (m *MockSendConn) WriteBatch(entries []queueEntry) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "WriteBatch", entries)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// WriteBatch indicates an expected call of WriteBatch.
+func (mr *MockSendConnMockRecorder) WriteBatch(entries any) *MockSendConnWriteBatchCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WriteBatch", reflect.TypeOf((*MockSendConn)(nil).WriteBatch), entries)
+	return &MockSendConnWriteBatchCall{Call: call}
+}
+
+// MockSendConnWriteBatchCall wrap *gomock.Call
+type MockSendConnWriteBatchCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSendConnWriteBatchCall) Return(arg0 error) *MockSendConnWriteBatchCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSendConnWriteBatchCall) Do(f func([]queueEntry) error) *MockSendConnWriteBatchCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSendConnWriteBatchCall) DoAndReturn(f func([]queueEntry) error) *MockSendConnWriteBatchCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // WriteTo mocks base method.
 func (m *MockSendConn) WriteTo(arg0 []byte, arg1 net.Addr, arg2 packetInfo) error {
 	m.ctrl.T.Helper()

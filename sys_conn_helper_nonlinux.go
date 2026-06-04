@@ -8,3 +8,6 @@ func forceSetSendBuffer(c any, bytes int) error    { return nil }
 func appendUDPSegmentSizeMsg([]byte, uint16) []byte { return nil }
 func isGSOError(error) bool                         { return false }
 func isPermissionError(err error) bool              { return false }
+
+// setMaxPacingRate is a no-op off Linux (SO_MAX_PACING_RATE + fq pacing is Linux-only).
+func setMaxPacingRate(any, uint64) error { return nil }
