@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"expvar"
+	"os"
 	"sync"
 
 	"github.com/quic-go/quic-go/internal/utils"
@@ -11,6 +12,12 @@ import (
 	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/quicvarint"
 )
+
+// dgObserveEnabled gates the diagnostic inner-TCP-seq reorder counters
+// (dg_send/dg_rcvin/dg_rcvout/dg_packer). They run a per-flow seen-set map op +
+// flow-hash on EVERY datagram — profiling showed ~5% of gw CPU under load — so they
+// default OFF. Set QUIC_GO_DG_OBSERVE=1 to re-enable for reorder diagnostics.
+var dgObserveEnabled = os.Getenv("QUIC_GO_DG_OBSERVE") == "1"
 
 // Datagram-queue drop counters. These are the blind spot the app-level drop
 // counters don't cover — a full send/recv queue here silently drops an
@@ -438,7 +445,7 @@ func (h *datagramQueue) PopBucket(idx int) {
 		return
 	}
 	f := bucket.PopFront()
-	if f != nil {
+	if f != nil && dgObserveEnabled {
 		h.sendObs.observe(f.Data, dgSendTotal, dgSendOOO)
 		h.sendGen.observe(f.Data, dgSendTotal, dgSendGenuine, dgSendRetr)
 	}
@@ -467,8 +474,10 @@ func (h *datagramQueue) NumBuckets() int {
 // as parseDatagramFrame already does), no race, no extra copy, no pool — and
 // the keepalive PING handling is no longer delayed by per-packet copy GC.
 func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
-	h.rcvInObs.observe(f.Data, dgRcvInTotal, dgRcvInOOO)
-	h.rcvInGen.observe(f.Data, dgRcvInTotal, dgRcvInGenuine, dgRcvInRetr)
+	if dgObserveEnabled {
+		h.rcvInObs.observe(f.Data, dgRcvInTotal, dgRcvInOOO)
+		h.rcvInGen.observe(f.Data, dgRcvInTotal, dgRcvInGenuine, dgRcvInRetr)
+	}
 	var queued bool
 	h.rcvMx.Lock()
 	if len(h.rcvQueue) < maxDatagramRcvQueueLen {
@@ -498,8 +507,10 @@ func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 			data := h.rcvQueue[0]
 			h.rcvQueue = h.rcvQueue[1:]
 			h.rcvMx.Unlock()
-			h.rcvOutObs.observe(data, dgRcvOutTotal, dgRcvOutOOO)
-			h.rcvOutGen.observe(data, dgRcvOutTotal, dgRcvOutGenuine, dgRcvOutRetr)
+			if dgObserveEnabled {
+				h.rcvOutObs.observe(data, dgRcvOutTotal, dgRcvOutOOO)
+				h.rcvOutGen.observe(data, dgRcvOutTotal, dgRcvOutGenuine, dgRcvOutRetr)
+			}
 			return data, nil
 		}
 		h.rcvMx.Unlock()

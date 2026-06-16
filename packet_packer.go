@@ -1057,9 +1057,11 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 	// the reorder enters after quic-go (send_queue / WriteBatch / AF_XDP TX / wire /
 	// client RX). If dg_packer_genuine matches tun0, the shuffle (or earlier packer
 	// reordering) is the cause — see also the multi-datagram packing loop.
-	for _, f := range pl.frames {
-		if df, ok := f.Frame.(*wire.DatagramFrame); ok {
-			p.packerObs.observe(df.Data, dgPackerTotal, dgPackerGenuine, dgPackerRetr)
+	if dgObserveEnabled {
+		for _, f := range pl.frames {
+			if df, ok := f.Frame.(*wire.DatagramFrame); ok {
+				p.packerObs.observe(df.Data, dgPackerTotal, dgPackerGenuine, dgPackerRetr)
+			}
 		}
 	}
 	for _, f := range pl.frames {
